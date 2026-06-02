@@ -185,6 +185,157 @@ def _add_macd_lr(df, fast=12, slow=26, signal_len=9, lr_length=100, lr_mult=4.0)
     return df
 
 
+def _add_mean_reversion(df):
+    """
+    Mean reversion boolean indicators.
+
+    Columns added
+    -------------
+    mr_below_sma20          Price below 20-day SMA (potential long reversion)
+    mr_above_sma20          Price above 20-day SMA (potential short reversion)
+    mr_bb_below_lower       Price below lower Bollinger Band (20d, 2sigma) — oversold stretch
+    mr_bb_above_upper       Price above upper Bollinger Band (20d, 2sigma) — overbought stretch
+    mr_rsi_oversold         RSI-14 < 30 — stretched to the downside
+    mr_rsi_overbought       RSI-14 > 70 — stretched to the upside
+    mr_z_score_low          20-day price Z-score < -1.5 — statistically cheap
+    mr_z_score_high         20-day price Z-score >  1.5 — statistically expensive
+    mr_below_vwap           Close below rolling VWAP approximation
+    mr_above_vwap           Close above rolling VWAP approximation
+    """
+    close = df["Close"].squeeze()
+
+    # SMA-20
+    sma20 = close.rolling(20).mean()
+    df["mr_below_sma20"] = (close < sma20).astype(bool)
+    df["mr_above_sma20"] = (close > sma20).astype(bool)
+
+    # Bollinger Bands (20d, 2sigma)
+    std20    = close.rolling(20).std()
+    bb_upper = sma20 + 2 * std20
+    bb_lower = sma20 - 2 * std20
+    df["mr_bb_below_lower"] = (close < bb_lower).astype(bool)
+    df["mr_bb_above_upper"] = (close > bb_upper).astype(bool)
+
+    # RSI-14 (reuse existing "rsi" column if already computed, else compute fresh)
+    if "rsi" in df.columns:
+        rsi = df["rsi"]
+    else:
+        delta    = close.diff()
+        avg_gain = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
+        avg_loss = (-delta.clip(upper=0)).ewm(com=13, adjust=False).mean()
+        rsi      = 100 - (100 / (1 + avg_gain / (avg_loss + 1e-9)))
+    df["mr_rsi_oversold"]   = (rsi < 30).astype(bool)
+    df["mr_rsi_overbought"] = (rsi > 70).astype(bool)
+
+    # Z-Score (20-day rolling)
+    z_score = (close - sma20) / std20.replace(0, np.nan)
+    df["mr_z_score_low"]  = (z_score < -1.5).astype(bool)
+    df["mr_z_score_high"] = (z_score >  1.5).astype(bool)
+
+    # VWAP approximation (typical price x volume, cumulative within each day)
+    typical = (df["High"] + df["Low"] + close) / 3
+    vwap    = (typical * df["Volume"]).cumsum() / df["Volume"].cumsum()
+    df["mr_below_vwap"] = (close < vwap).astype(bool)
+    df["mr_above_vwap"] = (close > vwap).astype(bool)
+
+    return df
+
+
+def _add_momentum(df):
+    """
+    Momentum boolean indicators.
+
+    Columns added
+    -------------
+    mo_roc_positive_20          20-day Rate-of-Change > 0 — upward momentum
+    mo_roc_negative_20          20-day Rate-of-Change < 0 — downward momentum
+    mo_golden_cross             SMA-50 crossed above SMA-200 — major bullish signal
+    mo_death_cross              SMA-50 crossed below SMA-200 — major bearish signal
+    mo_macd_cross_up            MACD line crossed above signal line (standalone, no band filter)
+    mo_macd_cross_down          MACD line crossed below signal line (standalone, no band filter)
+    mo_adx_trending             ADX-14 > 25 — trend strong enough to trade
+    mo_breakout_high20          Close > 20-day highest high — upside breakout
+    mo_breakdown_low20          Close < 20-day lowest low  — downside breakdown
+    mo_volume_surge             Volume > 2x its 20-day average — momentum confirmation
+    mo_consecutive_up3          3+ consecutive higher closes
+    mo_consecutive_down3        3+ consecutive lower closes
+    mo_combo_long               >= 2 momentum long signals firing together (high conviction)
+    mo_combo_short              >= 2 momentum short signals firing together (high conviction)
+    """
+    close = df["Close"].squeeze()
+
+    # Rate of Change (20d)
+    roc20 = close.pct_change(20) * 100
+    df["mo_roc_positive_20"] = (roc20 > 0).astype(bool)
+    df["mo_roc_negative_20"] = (roc20 < 0).astype(bool)
+
+    # Golden / Death Cross
+    sma50  = close.rolling(50).mean()
+    sma200 = close.rolling(200).mean()
+    prev_diff = (sma50 - sma200).shift(1)
+    curr_diff = (sma50 - sma200)
+    df["mo_golden_cross"] = ((prev_diff < 0) & (curr_diff >= 0)).astype(bool)
+    df["mo_death_cross"]  = ((prev_diff > 0) & (curr_diff <= 0)).astype(bool)
+
+    # MACD crossovers (standalone — no band filter, unlike macd_bullish/bearish_entry)
+    if "macd_line" in df.columns and "macd_signal" in df.columns:
+        macd   = df["macd_line"]
+        signal = df["macd_signal"]
+    else:
+        macd   = _ema(close, 12) - _ema(close, 26)
+        signal = _ema(macd, 9)
+    prev_md = (macd - signal).shift(1)
+    curr_md = (macd - signal)
+    df["mo_macd_cross_up"]   = ((prev_md < 0) & (curr_md >= 0)).astype(bool)
+    df["mo_macd_cross_down"] = ((prev_md > 0) & (curr_md <= 0)).astype(bool)
+
+    # ADX trending (reuse existing ADX column if available)
+    if "ADX" in df.columns:
+        df["mo_adx_trending"] = (df["ADX"] > 25).astype(bool)
+    else:
+        adx_ind = ta.trend.ADXIndicator(df["High"], df["Low"], df["Close"], window=14)
+        df["mo_adx_trending"] = (adx_ind.adx() > 25).astype(bool)
+
+    # 20-day breakout / breakdown (exclude today's bar)
+    high20 = close.rolling(20).max().shift(1)
+    low20  = close.rolling(20).min().shift(1)
+    df["mo_breakout_high20"] = (close > high20).astype(bool)
+    df["mo_breakdown_low20"] = (close < low20).astype(bool)
+
+    # Volume surge
+    vol_ma20 = df["Volume"].rolling(20).mean()
+    df["mo_volume_surge"] = (df["Volume"] > 2 * vol_ma20).astype(bool)
+
+    # Consecutive up / down closes
+    daily_ret   = close.diff()
+    up          = (daily_ret > 0).astype(int)
+    down        = (daily_ret < 0).astype(int)
+    consec_up   = up.groupby((up   == 0).cumsum()).cumsum()
+    consec_down = down.groupby((down == 0).cumsum()).cumsum()
+    df["mo_consecutive_up3"]   = (consec_up   >= 3).astype(bool)
+    df["mo_consecutive_down3"] = (consec_down >= 3).astype(bool)
+
+    # High-conviction composite signals (>= 2 signals firing together)
+    long_votes = (
+        df["mo_roc_positive_20"].astype(int) +
+        df["mo_macd_cross_up"].astype(int) +
+        df["mo_breakout_high20"].astype(int) +
+        df["mo_volume_surge"].astype(int) +
+        df["mo_consecutive_up3"].astype(int)
+    )
+    short_votes = (
+        df["mo_roc_negative_20"].astype(int) +
+        df["mo_macd_cross_down"].astype(int) +
+        df["mo_breakdown_low20"].astype(int) +
+        df["mo_volume_surge"].astype(int) +
+        df["mo_consecutive_down3"].astype(int)
+    )
+    df["mo_combo_long"]  = (long_votes  >= 2).astype(bool)
+    df["mo_combo_short"] = (short_votes >= 2).astype(bool)
+
+    return df
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
@@ -200,12 +351,41 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df = _add_structural_trend(df)
     df = _add_adx(df)
     df = _add_macd_lr(df)
+    df = _add_mean_reversion(df)
+    df = _add_momentum(df)
     return df
 
 
 # Feature columns to use as model input (edit here to change for both files)
 FEATURES = [
     "Close",
+    # ── existing entries ──────────────────────────────────────────────────────
     "macd_bullish_entry",
     "macd_bearish_entry",
+    # ── mean reversion ────────────────────────────────────────────────────────
+    "mr_below_sma20",
+    "mr_above_sma20",
+    "mr_bb_below_lower",
+    "mr_bb_above_upper",
+    "mr_rsi_oversold",
+    "mr_rsi_overbought",
+    "mr_z_score_low",
+    "mr_z_score_high",
+    "mr_below_vwap",
+    "mr_above_vwap",
+    # ── momentum ──────────────────────────────────────────────────────────────
+    "mo_roc_positive_20",
+    "mo_roc_negative_20",
+    "mo_golden_cross",
+    "mo_death_cross",
+    "mo_macd_cross_up",
+    "mo_macd_cross_down",
+    "mo_adx_trending",
+    "mo_breakout_high20",
+    "mo_breakdown_low20",
+    "mo_volume_surge",
+    "mo_consecutive_up3",
+    "mo_consecutive_down3",
+    "mo_combo_long",
+    "mo_combo_short",
 ]

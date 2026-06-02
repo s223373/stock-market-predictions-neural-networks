@@ -22,56 +22,10 @@ import ta
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import confusion_matrix, classification_report
 from feature_engineering import build_features, FEATURES
+from model import StockPriceLSTMNetwork
 
 warnings.filterwarnings("ignore")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 1.  MODEL DEFINITION
-# ─────────────────────────────────────────────────────────────────────────────
-
-class StockPriceLSTMNetwork(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, num_layers=1, dropout=0.3):
-        super().__init__()
-        self.hidden_size   = hidden_size
-        self.num_layers    = num_layers
-        self.layer_norm    = nn.LayerNorm(hidden_size)
-        self.lstm          = nn.LSTM(input_size, hidden_size, num_layers=num_layers,
-                                     dropout=0.1, batch_first=True)
-        self.dropout       = nn.Dropout(p=dropout)
-        self.fc1           = nn.Linear(hidden_size, hidden_size // 2)
-        self.relu          = nn.ReLU()
-        self.fc2           = nn.Linear(hidden_size // 2, output_size)
-        self.residual_proj = nn.Linear(input_size, hidden_size)
-        self._init_weights()
-
-    def _init_weights(self):
-        for name, param in self.lstm.named_parameters():
-            if 'weight_ih' in name:
-                nn.init.xavier_uniform_(param)
-            elif 'weight_hh' in name:
-                nn.init.orthogonal_(param)
-            elif 'bias' in name:
-                nn.init.zeros_(param)
-                n = param.size(0)
-                param.data[n // 4 : n // 2].fill_(1.0)
-        nn.init.xavier_uniform_(self.fc1.weight)
-        nn.init.xavier_uniform_(self.fc2.weight)
-
-    def forward(self, seq):
-        h0 = torch.zeros(self.num_layers, 1, self.hidden_size)
-        c0 = torch.zeros(self.num_layers, 1, self.hidden_size)
-        lstm_out, _  = self.lstm(seq.view(1, len(seq), -1), (h0, c0))
-        residual     = self.residual_proj(seq[-1].unsqueeze(0))
-        out          = self.layer_norm(lstm_out[:, -1, :] + residual)
-        out          = self.relu(self.fc1(out))
-        out          = self.dropout(out)
-        return self.fc2(out).squeeze(0)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 2.  DATA
-# ─────────────────────────────────────────────────────────────────────────────
 
 TICKER           = "AAPL"
 WINDOW_SIZE      = 14
@@ -80,7 +34,7 @@ THRESHOLD        = 1.0
 HIDDEN_SIZE      = 64
 NUM_LAYERS       = 1
 DROPOUT          = 0.3
-GATE_ON_SIGNALS  = True    # True  → only predict when a signal feature is active
+GATE_ON_SIGNALS  = False    # True  → only predict when a signal feature is active
                             # False → always predict
 
 # Signal features = everything except the first column (Close)
@@ -113,7 +67,7 @@ def load_and_prepare_data() -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3.  PREDICTION
+# 1.  PREDICTION
 # ─────────────────────────────────────────────────────────────────────────────
 
 def predict_forward(model, raw_window, scaler, close_scaler):
@@ -157,7 +111,7 @@ def any_signal_active(raw_window: np.ndarray) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4.  WALK-FORWARD BACKTEST
+# 2.  WALK-FORWARD BACKTEST
 # ─────────────────────────────────────────────────────────────────────────────
 
 def determine_actual_outcome(actual_closes, threshold=THRESHOLD):
@@ -277,7 +231,7 @@ def run_walk_forward_backtest(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5.  METRICS
+# 3.  METRICS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_and_print_metrics(results: pd.DataFrame) -> dict:
@@ -403,7 +357,7 @@ def compute_and_print_metrics(results: pd.DataFrame) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6.  MAIN
+# 4.  MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args():
