@@ -206,15 +206,15 @@ def _add_mean_reversion(df):
 
     # SMA-20
     sma20 = close.rolling(20).mean()
-    df["mr_below_sma20"] = (close < sma20).astype(bool)
-    df["mr_above_sma20"] = (close > sma20).astype(bool)
+    df["mr_below_sma20"] = (close < sma20).astype(float)
+    df["mr_above_sma20"] = (close > sma20).astype(float)
 
     # Bollinger Bands (20d, 2sigma)
     std20    = close.rolling(20).std()
     bb_upper = sma20 + 2 * std20
     bb_lower = sma20 - 2 * std20
-    df["mr_bb_below_lower"] = (close < bb_lower).astype(bool)
-    df["mr_bb_above_upper"] = (close > bb_upper).astype(bool)
+    df["mr_bb_below_lower"] = (close < bb_lower).astype(float)
+    df["mr_bb_above_upper"] = (close > bb_upper).astype(float)
 
     # RSI-14 (reuse existing "rsi" column if already computed, else compute fresh)
     if "rsi" in df.columns:
@@ -224,19 +224,19 @@ def _add_mean_reversion(df):
         avg_gain = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
         avg_loss = (-delta.clip(upper=0)).ewm(com=13, adjust=False).mean()
         rsi      = 100 - (100 / (1 + avg_gain / (avg_loss + 1e-9)))
-    df["mr_rsi_oversold"]   = (rsi < 30).astype(bool)
-    df["mr_rsi_overbought"] = (rsi > 70).astype(bool)
+    df["mr_rsi_oversold"]   = (rsi < 30).astype(float)
+    df["mr_rsi_overbought"] = (rsi > 70).astype(float)
 
     # Z-Score (20-day rolling)
     z_score = (close - sma20) / std20.replace(0, np.nan)
-    df["mr_z_score_low"]  = (z_score < -1.5).astype(bool)
-    df["mr_z_score_high"] = (z_score >  1.5).astype(bool)
+    df["mr_z_score_low"]  = (z_score < -1.5).astype(float)
+    df["mr_z_score_high"] = (z_score >  1.5).astype(float)
 
     # VWAP approximation (typical price x volume, cumulative within each day)
     typical = (df["High"] + df["Low"] + close) / 3
     vwap    = (typical * df["Volume"]).cumsum() / df["Volume"].cumsum()
-    df["mr_below_vwap"] = (close < vwap).astype(bool)
-    df["mr_above_vwap"] = (close > vwap).astype(bool)
+    df["mr_below_vwap"] = (close < vwap).astype(float)
+    df["mr_above_vwap"] = (close > vwap).astype(float)
 
     return df
 
@@ -266,16 +266,16 @@ def _add_momentum(df):
 
     # Rate of Change (20d)
     roc20 = close.pct_change(20) * 100
-    df["mo_roc_positive_20"] = (roc20 > 0).astype(bool)
-    df["mo_roc_negative_20"] = (roc20 < 0).astype(bool)
+    df["mo_roc_positive_20"] = (roc20 > 0).astype(float)
+    df["mo_roc_negative_20"] = (roc20 < 0).astype(float)
 
     # Golden / Death Cross
     sma50  = close.rolling(50).mean()
     sma200 = close.rolling(200).mean()
     prev_diff = (sma50 - sma200).shift(1)
     curr_diff = (sma50 - sma200)
-    df["mo_golden_cross"] = ((prev_diff < 0) & (curr_diff >= 0)).astype(bool)
-    df["mo_death_cross"]  = ((prev_diff > 0) & (curr_diff <= 0)).astype(bool)
+    df["mo_golden_cross"] = ((prev_diff < 0) & (curr_diff >= 0)).astype(float)
+    df["mo_death_cross"]  = ((prev_diff > 0) & (curr_diff <= 0)).astype(float)
 
     # MACD crossovers (standalone — no band filter, unlike macd_bullish/bearish_entry)
     if "macd_line" in df.columns and "macd_signal" in df.columns:
@@ -286,25 +286,25 @@ def _add_momentum(df):
         signal = _ema(macd, 9)
     prev_md = (macd - signal).shift(1)
     curr_md = (macd - signal)
-    df["mo_macd_cross_up"]   = ((prev_md < 0) & (curr_md >= 0)).astype(bool)
-    df["mo_macd_cross_down"] = ((prev_md > 0) & (curr_md <= 0)).astype(bool)
+    df["mo_macd_cross_up"]   = ((prev_md < 0) & (curr_md >= 0)).astype(float)
+    df["mo_macd_cross_down"] = ((prev_md > 0) & (curr_md <= 0)).astype(float)
 
     # ADX trending (reuse existing ADX column if available)
     if "ADX" in df.columns:
-        df["mo_adx_trending"] = (df["ADX"] > 25).astype(bool)
+        df["mo_adx_trending"] = (df["ADX"] > 25).astype(float)
     else:
         adx_ind = ta.trend.ADXIndicator(df["High"], df["Low"], df["Close"], window=14)
-        df["mo_adx_trending"] = (adx_ind.adx() > 25).astype(bool)
+        df["mo_adx_trending"] = (adx_ind.adx() > 25).astype(float)
 
     # 20-day breakout / breakdown (exclude today's bar)
     high20 = close.rolling(20).max().shift(1)
     low20  = close.rolling(20).min().shift(1)
-    df["mo_breakout_high20"] = (close > high20).astype(bool)
-    df["mo_breakdown_low20"] = (close < low20).astype(bool)
+    df["mo_breakout_high20"] = (close > high20).astype(float)
+    df["mo_breakdown_low20"] = (close < low20).astype(float)
 
     # Volume surge
     vol_ma20 = df["Volume"].rolling(20).mean()
-    df["mo_volume_surge"] = (df["Volume"] > 2 * vol_ma20).astype(bool)
+    df["mo_volume_surge"] = (df["Volume"] > 2 * vol_ma20).astype(float)
 
     # Consecutive up / down closes
     daily_ret   = close.diff()
@@ -312,8 +312,8 @@ def _add_momentum(df):
     down        = (daily_ret < 0).astype(int)
     consec_up   = up.groupby((up   == 0).cumsum()).cumsum()
     consec_down = down.groupby((down == 0).cumsum()).cumsum()
-    df["mo_consecutive_up3"]   = (consec_up   >= 3).astype(bool)
-    df["mo_consecutive_down3"] = (consec_down >= 3).astype(bool)
+    df["mo_consecutive_up3"]   = (consec_up   >= 3).astype(float)
+    df["mo_consecutive_down3"] = (consec_down >= 3).astype(float)
 
     # High-conviction composite signals (>= 2 signals firing together)
     long_votes = (
@@ -330,8 +330,175 @@ def _add_momentum(df):
         df["mo_volume_surge"].astype(int) +
         df["mo_consecutive_down3"].astype(int)
     )
-    df["mo_combo_long"]  = (long_votes  >= 2).astype(bool)
-    df["mo_combo_short"] = (short_votes >= 2).astype(bool)
+    df["mo_combo_long"]  = (long_votes  >= 2).astype(float)
+    df["mo_combo_short"] = (short_votes >= 2).astype(float)
+
+    return df
+
+
+def _add_sweep_fvg_setups(df, sweep_lookback=15, fvg_lookback=30):
+    """
+    ICT-style Liquidity Sweep → Fair Value Gap (FVG) entry setups.
+
+    Logic overview
+    --------------
+    A BULLISH setup requires two conditions to both be true within a
+    recent window:
+      1. SWEEP LOW  — within the last `sweep_lookback` candles, price
+         wicked below a prior session low and closed back above it
+         (stop-hunt of sell-side liquidity).
+      2. BULLISH FVG ENTRY — the current candle's low trades into a
+         bullish FVG (gap between candle[i-2].high and candle[i].low
+         where candle[i-1] is a strong up-move) that formed AFTER the
+         sweep, signalling smart-money stepped in to fill imbalance.
+
+    A BEARISH setup is the mirror:
+      1. SWEEP HIGH — price wicked above a prior session high and
+         closed back below it (stop-hunt of buy-side liquidity).
+      2. BEARISH FVG ENTRY — the current candle's high trades into a
+         bearish FVG (gap between candle[i-2].low and candle[i].high
+         where candle[i-1] is a strong down-move) that formed AFTER
+         the sweep.
+
+    Columns added
+    -------------
+    fvg_bull_top            Upper boundary of the most recent active bullish FVG
+    fvg_bull_bot            Lower boundary of the most recent active bullish FVG
+    fvg_bear_top            Upper boundary of the most recent active bearish FVG
+    fvg_bear_bot            Lower boundary of the most recent active bearish FVG
+    in_bull_fvg             Close is inside an active bullish FVG right now
+    in_bear_fvg             Close is inside an active bearish FVG right now
+    recent_low_sweep        A prior-session low was swept (wicked & closed above)
+                            within the last `sweep_lookback` candles
+    recent_high_sweep       A prior-session high was swept (wicked & closed below)
+                            within the last `sweep_lookback` candles
+    setup_bull_sweep_fvg    Full bullish setup: recent low sweep + price in bullish FVG
+    setup_bear_sweep_fvg    Full bearish setup: recent high sweep + price in bearish FVG
+    setup_bull_confirmed    setup_bull_sweep_fvg + current candle is green (confirmation)
+    setup_bear_confirmed    setup_bear_sweep_fvg + current candle is red  (confirmation)
+    """
+
+    high  = df["High"].values
+    low   = df["Low"].values
+    close = df["Close"].values
+    open_ = df["Open"].values
+    n     = len(df)
+
+    # ── 1. Identify all Fair Value Gaps ──────────────────────────────────────
+    # Bullish FVG: gap between candle[i-2].high and candle[i].low
+    #   formed when candle[i-1] is a strong bullish impulse candle
+    # Bearish FVG: gap between candle[i-2].low  and candle[i].high
+    #   formed when candle[i-1] is a strong bearish impulse candle
+
+    bull_fvg_top = np.full(n, np.nan)   # upper edge of bullish FVG at formation bar i
+    bull_fvg_bot = np.full(n, np.nan)   # lower edge
+    bear_fvg_top = np.full(n, np.nan)
+    bear_fvg_bot = np.full(n, np.nan)
+
+    for i in range(2, n):
+        # Bullish FVG: candle[i].low > candle[i-2].high  (gap above)
+        if low[i] > high[i - 2]:
+            bull_fvg_bot[i] = high[i - 2]
+            bull_fvg_top[i] = low[i]
+
+        # Bearish FVG: candle[i].high < candle[i-2].low  (gap below)
+        if high[i] < low[i - 2]:
+            bear_fvg_bot[i] = high[i]
+            bear_fvg_top[i] = low[i - 2]
+
+    # ── 2. Track the most recent ACTIVE FVG at each bar ──────────────────────
+    # An FVG is "active" until price fully closes through it.
+    # We carry the most recently formed FVG forward until it is invalidated.
+
+    active_bull_top = np.full(n, np.nan)
+    active_bull_bot = np.full(n, np.nan)
+    active_bear_top = np.full(n, np.nan)
+    active_bear_bot = np.full(n, np.nan)
+
+    cur_bull_top = cur_bull_bot = np.nan
+    cur_bear_top = cur_bear_bot = np.nan
+
+    for i in range(n):
+        # New FVG formed this bar → update active
+        if not np.isnan(bull_fvg_top[i]):
+            cur_bull_top = bull_fvg_top[i]
+            cur_bull_bot = bull_fvg_bot[i]
+        if not np.isnan(bear_fvg_top[i]):
+            cur_bear_top = bear_fvg_top[i]
+            cur_bear_bot = bear_fvg_bot[i]
+
+        # Invalidate bullish FVG if price closes below its bottom
+        if not np.isnan(cur_bull_bot) and close[i] < cur_bull_bot:
+            cur_bull_top = cur_bull_bot = np.nan
+
+        # Invalidate bearish FVG if price closes above its top
+        if not np.isnan(cur_bear_top) and close[i] > cur_bear_top:
+            cur_bear_top = cur_bear_bot = np.nan
+
+        active_bull_top[i] = cur_bull_top
+        active_bull_bot[i] = cur_bull_bot
+        active_bear_top[i] = cur_bear_top
+        active_bear_bot[i] = cur_bear_bot
+
+    df["fvg_bull_top"] = active_bull_top
+    df["fvg_bull_bot"] = active_bull_bot
+    df["fvg_bear_top"] = active_bear_top
+    df["fvg_bear_bot"] = active_bear_bot
+
+    # ── 3. Is price currently inside an FVG? ─────────────────────────────────
+    # Bullish FVG entry: low trades into the gap (low <= top, close >= bot)
+    df["in_bull_fvg"] = (
+        (df["Low"]  <= df["fvg_bull_top"]) &
+        (df["Close"] >= df["fvg_bull_bot"])
+    ).astype(float)
+
+    # Bearish FVG entry: high trades into the gap (high >= bot, close <= top)
+    df["in_bear_fvg"] = (
+        (df["High"]  >= df["fvg_bear_bot"]) &
+        (df["Close"] <= df["fvg_bear_top"])
+    ).astype(float)
+
+    # ── 4. Recent sweep flags (within last N candles) ─────────────────────────
+    # Reuse the per-bar sweep booleans already added by _add_liquidity_sweeps.
+    # Roll a window to check if a sweep occurred in the last sweep_lookback bars.
+    if "low_wick_sweep" not in df.columns or "high_wick_sweep" not in df.columns:
+        raise RuntimeError(
+            "_add_sweep_fvg_setups requires _add_liquidity_sweeps to run first."
+        )
+
+    df["recent_low_sweep"] = (
+        df["low_wick_sweep"]
+        .astype(int)
+        .rolling(sweep_lookback, min_periods=1)
+        .max()
+        .astype(float)
+    )
+    df["recent_high_sweep"] = (
+        df["high_wick_sweep"]
+        .astype(int)
+        .rolling(sweep_lookback, min_periods=1)
+        .max()
+        .astype(float)
+    )
+
+    # ── 5. Full setups ────────────────────────────────────────────────────────
+    # BULLISH: prior session low swept recently + price now entering bullish FVG
+    df["setup_bull_sweep_fvg"] = (
+        df["recent_low_sweep"] == 1 & df["in_bull_fvg"] == 1
+    ).astype(float)
+
+    # BEARISH: prior session high swept recently + price now entering bearish FVG
+    df["setup_bear_sweep_fvg"] = (
+        df["recent_high_sweep"] == 1 & df["in_bear_fvg"] == 1
+    ).astype(float)
+
+    # ── 6. Confirmation candle ────────────────────────────────────────────────
+    # Require the entry candle itself to close in the expected direction
+    is_green = df["Close"] > df["Open"]
+    is_red   = df["Close"] < df["Open"]
+
+    df["setup_bull_confirmed"] = (df["setup_bull_sweep_fvg"] == 1 & is_green).astype(float)
+    df["setup_bear_confirmed"] = (df["setup_bear_sweep_fvg"] == 1 & is_red).astype(float)
 
     return df
 
@@ -346,13 +513,14 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     Returns the enriched dataframe.
     """
     df = df.copy()
-    df = _add_liquidity_sweeps(df)
+    df = _add_liquidity_sweeps(df)       # must run before _add_sweep_fvg_setups
     df = _add_candle_features(df)
     df = _add_structural_trend(df)
     df = _add_adx(df)
     df = _add_macd_lr(df)
     df = _add_mean_reversion(df)
     df = _add_momentum(df)
+    df = _add_sweep_fvg_setups(df)
     return df
 
 
@@ -363,29 +531,12 @@ FEATURES = [
     "macd_bullish_entry",
     "macd_bearish_entry",
     # ── mean reversion ────────────────────────────────────────────────────────
-    "mr_below_sma20",
-    "mr_above_sma20",
-    "mr_bb_below_lower",
-    "mr_bb_above_upper",
-    "mr_rsi_oversold",
-    "mr_rsi_overbought",
-    "mr_z_score_low",
-    "mr_z_score_high",
     "mr_below_vwap",
     "mr_above_vwap",
     # ── momentum ──────────────────────────────────────────────────────────────
-    "mo_roc_positive_20",
-    "mo_roc_negative_20",
-    "mo_golden_cross",
-    "mo_death_cross",
-    "mo_macd_cross_up",
-    "mo_macd_cross_down",
-    "mo_adx_trending",
-    "mo_breakout_high20",
-    "mo_breakdown_low20",
-    "mo_volume_surge",
-    "mo_consecutive_up3",
-    "mo_consecutive_down3",
     "mo_combo_long",
     "mo_combo_short",
+    # ── sweep + FVG setups ────────────────────────────────────────────────────
+    "setup_bull_confirmed",
+    "setup_bear_confirmed",
 ]
