@@ -483,22 +483,18 @@ def _add_sweep_fvg_setups(df, sweep_lookback=15, fvg_lookback=30):
 
     # ── 5. Full setups ────────────────────────────────────────────────────────
     # BULLISH: prior session low swept recently + price now entering bullish FVG
-    df["setup_bull_sweep_fvg"] = (
-        df["recent_low_sweep"] == 1 & df["in_bull_fvg"] == 1
-    ).astype(float)
+    df["setup_bull_sweep_fvg"] = (df["recent_low_sweep"] * df["in_bull_fvg"]).clip(0, 1)
 
     # BEARISH: prior session high swept recently + price now entering bearish FVG
-    df["setup_bear_sweep_fvg"] = (
-        df["recent_high_sweep"] == 1 & df["in_bear_fvg"] == 1
-    ).astype(float)
+    df["setup_bear_sweep_fvg"] = (df["recent_high_sweep"] * df["in_bear_fvg"]).clip(0, 1)
 
     # ── 6. Confirmation candle ────────────────────────────────────────────────
     # Require the entry candle itself to close in the expected direction
     is_green = df["Close"] > df["Open"]
     is_red   = df["Close"] < df["Open"]
 
-    df["setup_bull_confirmed"] = (df["setup_bull_sweep_fvg"] == 1 & is_green).astype(float)
-    df["setup_bear_confirmed"] = (df["setup_bear_sweep_fvg"] == 1 & is_red).astype(float)
+    df["setup_bull_confirmed"] = (df["setup_bull_sweep_fvg"] * is_green.astype(float)).clip(0, 1)
+    df["setup_bear_confirmed"] = (df["setup_bear_sweep_fvg"] * is_red.astype(float)).clip(0, 1)
 
     return df
 
@@ -521,6 +517,13 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df = _add_mean_reversion(df)
     df = _add_momentum(df)
     df = _add_sweep_fvg_setups(df)
+
+    # Safety net: force every boolean-signal column to float32
+    # so PyTorch never receives a bool or object dtype tensor.
+    bool_signal_cols = [c for c in df.columns if c in FEATURES and c != "Close"]
+    for col in bool_signal_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce").astype("float32")
+
     return df
 
 
@@ -528,15 +531,19 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 FEATURES = [
     "Close",
     # ── existing entries ──────────────────────────────────────────────────────
-    "macd_bullish_entry",
-    "macd_bearish_entry",
     # ── mean reversion ────────────────────────────────────────────────────────
+    "mr_below_sma20",
+    "mr_above_sma20",
+    "mr_bb_below_lower",
+    "mr_bb_above_upper",
+    "mr_rsi_oversold",
+    "mr_rsi_overbought",
+    "mr_z_score_low",
+    "mr_z_score_high",
     "mr_below_vwap",
     "mr_above_vwap",
     # ── momentum ──────────────────────────────────────────────────────────────
     "mo_combo_long",
     "mo_combo_short",
     # ── sweep + FVG setups ────────────────────────────────────────────────────
-    "setup_bull_confirmed",
-    "setup_bear_confirmed",
 ]

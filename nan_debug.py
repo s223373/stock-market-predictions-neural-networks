@@ -11,7 +11,7 @@ import torch
 import yfinance as yf
 from sklearn.preprocessing import MinMaxScaler
 from feature_engineering import build_features, FEATURES
-from model import StockPriceLSTMNetwork, DirectionalLoss, prepare_price_input
+from model import StockPriceLSTMNetwork, DirectionalLoss, prepare_price_input, StockPriceLSTMNetworkDualStream
 
 TICKER      = "AAPL"
 WINDOW_SIZE = 14
@@ -87,7 +87,7 @@ print("\n" + "=" * 60)
 print("STEP 6 — Model forward pass (first 20 windows)")
 print("=" * 60)
 n_bool = len(bool_cols)
-model  = StockPriceLSTMNetwork(n_bool_features=n_bool, hidden_size=HIDDEN_SIZE, output_size=1)
+model  = StockPriceLSTMNetworkDualStream(n_bool_features=n_bool, hidden_size=HIDDEN_SIZE, output_size=1)
 model.eval()
 
 first_nan_forward = None
