@@ -532,16 +532,6 @@ FEATURES = [
     "Close",
     # ── existing entries ──────────────────────────────────────────────────────
     # ── mean reversion ────────────────────────────────────────────────────────
-    "mr_below_sma20",
-    "mr_above_sma20",
-    "mr_bb_below_lower",
-    "mr_bb_above_upper",
-    "mr_rsi_oversold",
-    "mr_rsi_overbought",
-    "mr_z_score_low",
-    "mr_z_score_high",
-    "mr_below_vwap",
-    "mr_above_vwap",
     # ── momentum ──────────────────────────────────────────────────────────────
     "mo_combo_long",
     "mo_combo_short",

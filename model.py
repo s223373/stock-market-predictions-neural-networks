@@ -82,6 +82,8 @@ DirectionalLoss                  Differentiable combination of HuberLoss and a s
                                  gradients from torch.sign).
 """
 
+import torch
+import torch.nn as nn
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -90,37 +92,37 @@ DirectionalLoss                  Differentiable combination of HuberLoss and a s
 
 def prepare_price_input(close_seq: torch.Tensor) -> torch.Tensor:
     """
-    Convert a raw Close price sequence to z-scored log-returns.
+    Convert a MinMaxScaler-scaled Close sequence to z-scored first differences.
 
     Parameters
     ----------
     close_seq : Tensor of shape (seq_len,) or (batch, seq_len)
-        Raw closing prices.
+        Close prices already scaled to (-1, 1) by MinMaxScaler.
 
     Returns
     -------
     Tensor of shape (seq_len-1, 1) or (batch, seq_len-1, 1)
-        Stationary, scale-invariant price representation ready for Stream 1.
+        Stationary, scale-invariant representation ready for Stream 1.
 
-    Why
-    ---
-    Raw price is non-stationary and regime-dependent — $150 in 2020 carries
-    a different distribution to $150 in 2024. Log-returns are stationary and
-    z-scoring over the input window makes the representation scale-invariant,
-    which is exactly what LSTMs need to generalise across price levels.
+    Why differences and not log-returns
+    ------------------------------------
+    Log-returns require strictly positive inputs — log(a/b) is NaN when a or b
+    is negative. MinMaxScaler with feature_range=(-1, 1) produces negative
+    values for any price below the midpoint of the training range, so
+    log-returns always produce NaN here. First differences are stationary,
+    work on any numeric range, and carry identical directional information.
+    Z-scoring over the window makes them scale-invariant.
     """
     if close_seq.dim() == 1:
-        log_ret = torch.log(close_seq[1:] / close_seq[:-1].clamp(min=1e-9))
-        mu  = log_ret.mean()
-        std = log_ret.std().clamp(min=1e-6)
-        return ((log_ret - mu) / std).unsqueeze(-1)          # (seq_len-1, 1)
+        diff = close_seq[1:] - close_seq[:-1]                # (seq_len-1,)
+        mu   = diff.mean()
+        std  = diff.std().clamp(min=1e-6)
+        return ((diff - mu) / std).unsqueeze(-1)             # (seq_len-1, 1)
     else:
-        # batched: (batch, seq_len)
-        log_ret = torch.log(close_seq[:, 1:] / close_seq[:, :-1].clamp(min=1e-9))
-        mu  = log_ret.mean(dim=1, keepdim=True)
-        std = log_ret.std(dim=1,  keepdim=True).clamp(min=1e-6)
-        return ((log_ret - mu) / std).unsqueeze(-1)          # (batch, seq_len-1, 1)
-
+        diff = close_seq[:, 1:] - close_seq[:, :-1]         # (batch, seq_len-1)
+        mu   = diff.mean(dim=1, keepdim=True)
+        std  = diff.std(dim=1,  keepdim=True).clamp(min=1e-6)
+        return ((diff - mu) / std).unsqueeze(-1)             # (batch, seq_len-1, 1)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TEMPORAL ATTENTION
