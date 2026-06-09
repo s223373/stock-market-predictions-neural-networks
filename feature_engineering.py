@@ -8,6 +8,7 @@ with a raw OHLCV dataframe to get back the fully enriched version.
 import numpy as np
 import pandas as pd
 import ta
+import yfinance as yf
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -162,61 +163,43 @@ def _add_macd_lr(df, fast=12, slow=26, signal_len=9, lr_length=100, lr_mult=4.0)
     df["near_lower_band"] = close <= (lr - 0.8 * dev)   # strong bearish trend
     df["touches_upper"]   = close >= (lr + dev)          # stretched / overvalued
     df["touches_lower"]   = close <= (lr - dev)          # compressed / undervalued
-    df["broke_above"]     = (close > (lr + dev)) & (close.shift(1) <= (lr + dev).shift(1))  # trend acceleration up
-    df["broke_below"]     = (close < (lr - dev)) & (close.shift(1) >= (lr - dev).shift(1))  # trend acceleration down
+    df["broke_above"]     = (close > (lr + dev)) & (close.shift(1) <= (lr + dev).shift(1))
+    df["broke_below"]     = (close < (lr - dev)) & (close.shift(1) >= (lr - dev).shift(1))
     band_width            = 2 * dev / (lr.abs() + 1e-9)
-    df["bands_widening"]  = band_width > band_width.shift(3)   # volatility increasing
-    df["bands_narrowing"] = band_width < band_width.shift(3)   # consolidation coming
+    df["bands_widening"]  = band_width > band_width.shift(3)
+    df["bands_narrowing"] = band_width < band_width.shift(3)
 
     # MACD Entry Confirmation
     macd_cross_up   = (macd > signal) & (macd.shift(1) <= signal.shift(1))
     macd_cross_down = (macd < signal) & (macd.shift(1) >= signal.shift(1))
-    df["macd_bullish_entry"] = macd_cross_up   & df["near_lower_band"]  # MACD bullish entry
-    df["macd_bearish_entry"] = macd_cross_down & df["near_upper_band"]  # MACD bearish entry
+    df["macd_bullish_entry"] = macd_cross_up   & df["near_lower_band"]
+    df["macd_bearish_entry"] = macd_cross_down & df["near_upper_band"]
 
     # RSI
     delta    = close.diff()
     avg_gain = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
     avg_loss = (-delta.clip(upper=0)).ewm(com=13, adjust=False).mean()
     df["rsi"]           = 100 - (100 / (1 + avg_gain / (avg_loss + 1e-9)))
-    df["rsi_overbought"]= df["rsi"] > 70   # stretched to the upside
-    df["rsi_oversold"]  = df["rsi"] < 30   # stretched to the downside
+    df["rsi_overbought"]= df["rsi"] > 70
+    df["rsi_oversold"]  = df["rsi"] < 30
 
     return df
 
 
 def _add_mean_reversion(df):
-    """
-    Mean reversion boolean indicators.
-
-    Columns added
-    -------------
-    mr_below_sma20          Price below 20-day SMA (potential long reversion)
-    mr_above_sma20          Price above 20-day SMA (potential short reversion)
-    mr_bb_below_lower       Price below lower Bollinger Band (20d, 2sigma) — oversold stretch
-    mr_bb_above_upper       Price above upper Bollinger Band (20d, 2sigma) — overbought stretch
-    mr_rsi_oversold         RSI-14 < 30 — stretched to the downside
-    mr_rsi_overbought       RSI-14 > 70 — stretched to the upside
-    mr_z_score_low          20-day price Z-score < -1.5 — statistically cheap
-    mr_z_score_high         20-day price Z-score >  1.5 — statistically expensive
-    mr_below_vwap           Close below rolling VWAP approximation
-    mr_above_vwap           Close above rolling VWAP approximation
-    """
+    """Mean reversion boolean indicators."""
     close = df["Close"].squeeze()
 
-    # SMA-20
     sma20 = close.rolling(20).mean()
     df["mr_below_sma20"] = (close < sma20).astype(float)
     df["mr_above_sma20"] = (close > sma20).astype(float)
 
-    # Bollinger Bands (20d, 2sigma)
     std20    = close.rolling(20).std()
     bb_upper = sma20 + 2 * std20
     bb_lower = sma20 - 2 * std20
     df["mr_bb_below_lower"] = (close < bb_lower).astype(float)
     df["mr_bb_above_upper"] = (close > bb_upper).astype(float)
 
-    # RSI-14 (reuse existing "rsi" column if already computed, else compute fresh)
     if "rsi" in df.columns:
         rsi = df["rsi"]
     else:
@@ -227,12 +210,10 @@ def _add_mean_reversion(df):
     df["mr_rsi_oversold"]   = (rsi < 30).astype(float)
     df["mr_rsi_overbought"] = (rsi > 70).astype(float)
 
-    # Z-Score (20-day rolling)
     z_score = (close - sma20) / std20.replace(0, np.nan)
     df["mr_z_score_low"]  = (z_score < -1.5).astype(float)
     df["mr_z_score_high"] = (z_score >  1.5).astype(float)
 
-    # VWAP approximation (typical price x volume, cumulative within each day)
     typical = (df["High"] + df["Low"] + close) / 3
     vwap    = (typical * df["Volume"]).cumsum() / df["Volume"].cumsum()
     df["mr_below_vwap"] = (close < vwap).astype(float)
@@ -242,34 +223,13 @@ def _add_mean_reversion(df):
 
 
 def _add_momentum(df):
-    """
-    Momentum boolean indicators.
-
-    Columns added
-    -------------
-    mo_roc_positive_20          20-day Rate-of-Change > 0 — upward momentum
-    mo_roc_negative_20          20-day Rate-of-Change < 0 — downward momentum
-    mo_golden_cross             SMA-50 crossed above SMA-200 — major bullish signal
-    mo_death_cross              SMA-50 crossed below SMA-200 — major bearish signal
-    mo_macd_cross_up            MACD line crossed above signal line (standalone, no band filter)
-    mo_macd_cross_down          MACD line crossed below signal line (standalone, no band filter)
-    mo_adx_trending             ADX-14 > 25 — trend strong enough to trade
-    mo_breakout_high20          Close > 20-day highest high — upside breakout
-    mo_breakdown_low20          Close < 20-day lowest low  — downside breakdown
-    mo_volume_surge             Volume > 2x its 20-day average — momentum confirmation
-    mo_consecutive_up3          3+ consecutive higher closes
-    mo_consecutive_down3        3+ consecutive lower closes
-    mo_combo_long               >= 2 momentum long signals firing together (high conviction)
-    mo_combo_short              >= 2 momentum short signals firing together (high conviction)
-    """
+    """Momentum boolean indicators."""
     close = df["Close"].squeeze()
 
-    # Rate of Change (20d)
     roc20 = close.pct_change(20) * 100
     df["mo_roc_positive_20"] = (roc20 > 0).astype(float)
     df["mo_roc_negative_20"] = (roc20 < 0).astype(float)
 
-    # Golden / Death Cross
     sma50  = close.rolling(50).mean()
     sma200 = close.rolling(200).mean()
     prev_diff = (sma50 - sma200).shift(1)
@@ -277,7 +237,6 @@ def _add_momentum(df):
     df["mo_golden_cross"] = ((prev_diff < 0) & (curr_diff >= 0)).astype(float)
     df["mo_death_cross"]  = ((prev_diff > 0) & (curr_diff <= 0)).astype(float)
 
-    # MACD crossovers (standalone — no band filter, unlike macd_bullish/bearish_entry)
     if "macd_line" in df.columns and "macd_signal" in df.columns:
         macd   = df["macd_line"]
         signal = df["macd_signal"]
@@ -289,24 +248,20 @@ def _add_momentum(df):
     df["mo_macd_cross_up"]   = ((prev_md < 0) & (curr_md >= 0)).astype(float)
     df["mo_macd_cross_down"] = ((prev_md > 0) & (curr_md <= 0)).astype(float)
 
-    # ADX trending (reuse existing ADX column if available)
     if "ADX" in df.columns:
         df["mo_adx_trending"] = (df["ADX"] > 25).astype(float)
     else:
         adx_ind = ta.trend.ADXIndicator(df["High"], df["Low"], df["Close"], window=14)
         df["mo_adx_trending"] = (adx_ind.adx() > 25).astype(float)
 
-    # 20-day breakout / breakdown (exclude today's bar)
     high20 = close.rolling(20).max().shift(1)
     low20  = close.rolling(20).min().shift(1)
     df["mo_breakout_high20"] = (close > high20).astype(float)
     df["mo_breakdown_low20"] = (close < low20).astype(float)
 
-    # Volume surge
     vol_ma20 = df["Volume"].rolling(20).mean()
     df["mo_volume_surge"] = (df["Volume"] > 2 * vol_ma20).astype(float)
 
-    # Consecutive up / down closes
     daily_ret   = close.diff()
     up          = (daily_ret > 0).astype(int)
     down        = (daily_ret < 0).astype(int)
@@ -315,7 +270,6 @@ def _add_momentum(df):
     df["mo_consecutive_up3"]   = (consec_up   >= 3).astype(float)
     df["mo_consecutive_down3"] = (consec_down >= 3).astype(float)
 
-    # High-conviction composite signals (>= 2 signals firing together)
     long_votes = (
         df["mo_roc_positive_20"].astype(int) +
         df["mo_macd_cross_up"].astype(int) +
@@ -337,46 +291,7 @@ def _add_momentum(df):
 
 
 def _add_sweep_fvg_setups(df, sweep_lookback=15, fvg_lookback=30):
-    """
-    ICT-style Liquidity Sweep → Fair Value Gap (FVG) entry setups.
-
-    Logic overview
-    --------------
-    A BULLISH setup requires two conditions to both be true within a
-    recent window:
-      1. SWEEP LOW  — within the last `sweep_lookback` candles, price
-         wicked below a prior session low and closed back above it
-         (stop-hunt of sell-side liquidity).
-      2. BULLISH FVG ENTRY — the current candle's low trades into a
-         bullish FVG (gap between candle[i-2].high and candle[i].low
-         where candle[i-1] is a strong up-move) that formed AFTER the
-         sweep, signalling smart-money stepped in to fill imbalance.
-
-    A BEARISH setup is the mirror:
-      1. SWEEP HIGH — price wicked above a prior session high and
-         closed back below it (stop-hunt of buy-side liquidity).
-      2. BEARISH FVG ENTRY — the current candle's high trades into a
-         bearish FVG (gap between candle[i-2].low and candle[i].high
-         where candle[i-1] is a strong down-move) that formed AFTER
-         the sweep.
-
-    Columns added
-    -------------
-    fvg_bull_top            Upper boundary of the most recent active bullish FVG
-    fvg_bull_bot            Lower boundary of the most recent active bullish FVG
-    fvg_bear_top            Upper boundary of the most recent active bearish FVG
-    fvg_bear_bot            Lower boundary of the most recent active bearish FVG
-    in_bull_fvg             Close is inside an active bullish FVG right now
-    in_bear_fvg             Close is inside an active bearish FVG right now
-    recent_low_sweep        A prior-session low was swept (wicked & closed above)
-                            within the last `sweep_lookback` candles
-    recent_high_sweep       A prior-session high was swept (wicked & closed below)
-                            within the last `sweep_lookback` candles
-    setup_bull_sweep_fvg    Full bullish setup: recent low sweep + price in bullish FVG
-    setup_bear_sweep_fvg    Full bearish setup: recent high sweep + price in bearish FVG
-    setup_bull_confirmed    setup_bull_sweep_fvg + current candle is green (confirmation)
-    setup_bear_confirmed    setup_bear_sweep_fvg + current candle is red  (confirmation)
-    """
+    """ICT-style Liquidity Sweep → Fair Value Gap (FVG) entry setups."""
 
     high  = df["High"].values
     low   = df["Low"].values
@@ -384,31 +299,18 @@ def _add_sweep_fvg_setups(df, sweep_lookback=15, fvg_lookback=30):
     open_ = df["Open"].values
     n     = len(df)
 
-    # ── 1. Identify all Fair Value Gaps ──────────────────────────────────────
-    # Bullish FVG: gap between candle[i-2].high and candle[i].low
-    #   formed when candle[i-1] is a strong bullish impulse candle
-    # Bearish FVG: gap between candle[i-2].low  and candle[i].high
-    #   formed when candle[i-1] is a strong bearish impulse candle
-
-    bull_fvg_top = np.full(n, np.nan)   # upper edge of bullish FVG at formation bar i
-    bull_fvg_bot = np.full(n, np.nan)   # lower edge
+    bull_fvg_top = np.full(n, np.nan)
+    bull_fvg_bot = np.full(n, np.nan)
     bear_fvg_top = np.full(n, np.nan)
     bear_fvg_bot = np.full(n, np.nan)
 
     for i in range(2, n):
-        # Bullish FVG: candle[i].low > candle[i-2].high  (gap above)
         if low[i] > high[i - 2]:
             bull_fvg_bot[i] = high[i - 2]
             bull_fvg_top[i] = low[i]
-
-        # Bearish FVG: candle[i].high < candle[i-2].low  (gap below)
         if high[i] < low[i - 2]:
             bear_fvg_bot[i] = high[i]
             bear_fvg_top[i] = low[i - 2]
-
-    # ── 2. Track the most recent ACTIVE FVG at each bar ──────────────────────
-    # An FVG is "active" until price fully closes through it.
-    # We carry the most recently formed FVG forward until it is invalidated.
 
     active_bull_top = np.full(n, np.nan)
     active_bull_bot = np.full(n, np.nan)
@@ -419,7 +321,6 @@ def _add_sweep_fvg_setups(df, sweep_lookback=15, fvg_lookback=30):
     cur_bear_top = cur_bear_bot = np.nan
 
     for i in range(n):
-        # New FVG formed this bar → update active
         if not np.isnan(bull_fvg_top[i]):
             cur_bull_top = bull_fvg_top[i]
             cur_bull_bot = bull_fvg_bot[i]
@@ -427,11 +328,8 @@ def _add_sweep_fvg_setups(df, sweep_lookback=15, fvg_lookback=30):
             cur_bear_top = bear_fvg_top[i]
             cur_bear_bot = bear_fvg_bot[i]
 
-        # Invalidate bullish FVG if price closes below its bottom
         if not np.isnan(cur_bull_bot) and close[i] < cur_bull_bot:
             cur_bull_top = cur_bull_bot = np.nan
-
-        # Invalidate bearish FVG if price closes above its top
         if not np.isnan(cur_bear_top) and close[i] > cur_bear_top:
             cur_bear_top = cur_bear_bot = np.nan
 
@@ -445,22 +343,16 @@ def _add_sweep_fvg_setups(df, sweep_lookback=15, fvg_lookback=30):
     df["fvg_bear_top"] = active_bear_top
     df["fvg_bear_bot"] = active_bear_bot
 
-    # ── 3. Is price currently inside an FVG? ─────────────────────────────────
-    # Bullish FVG entry: low trades into the gap (low <= top, close >= bot)
     df["in_bull_fvg"] = (
         (df["Low"]  <= df["fvg_bull_top"]) &
         (df["Close"] >= df["fvg_bull_bot"])
     ).astype(float)
 
-    # Bearish FVG entry: high trades into the gap (high >= bot, close <= top)
     df["in_bear_fvg"] = (
         (df["High"]  >= df["fvg_bear_bot"]) &
         (df["Close"] <= df["fvg_bear_top"])
     ).astype(float)
 
-    # ── 4. Recent sweep flags (within last N candles) ─────────────────────────
-    # Reuse the per-bar sweep booleans already added by _add_liquidity_sweeps.
-    # Roll a window to check if a sweep occurred in the last sweep_lookback bars.
     if "low_wick_sweep" not in df.columns or "high_wick_sweep" not in df.columns:
         raise RuntimeError(
             "_add_sweep_fvg_setups requires _add_liquidity_sweeps to run first."
@@ -481,20 +373,126 @@ def _add_sweep_fvg_setups(df, sweep_lookback=15, fvg_lookback=30):
         .astype(float)
     )
 
-    # ── 5. Full setups ────────────────────────────────────────────────────────
-    # BULLISH: prior session low swept recently + price now entering bullish FVG
     df["setup_bull_sweep_fvg"] = (df["recent_low_sweep"] * df["in_bull_fvg"]).clip(0, 1)
-
-    # BEARISH: prior session high swept recently + price now entering bearish FVG
     df["setup_bear_sweep_fvg"] = (df["recent_high_sweep"] * df["in_bear_fvg"]).clip(0, 1)
 
-    # ── 6. Confirmation candle ────────────────────────────────────────────────
-    # Require the entry candle itself to close in the expected direction
-    is_green = df["Close"] > df["Open"]
-    is_red   = df["Close"] < df["Open"]
+    is_green = (df["Close"] > df["Open"]).astype(float)
+    is_red   = (df["Close"] < df["Open"]).astype(float)
 
-    df["setup_bull_confirmed"] = (df["setup_bull_sweep_fvg"] * is_green.astype(float)).clip(0, 1)
-    df["setup_bear_confirmed"] = (df["setup_bear_sweep_fvg"] * is_red.astype(float)).clip(0, 1)
+    df["setup_bull_confirmed"] = (df["setup_bull_sweep_fvg"] * is_green).clip(0, 1)
+    df["setup_bear_confirmed"] = (df["setup_bear_sweep_fvg"] * is_red).clip(0, 1)
+
+    return df
+
+
+def _add_index_divergence(df, period="30d", interval="5m", min_ret_threshold=0.0005):
+    """
+    SPY / QQQ divergence features for mean-reversion stat-arb signals.
+
+    Downloads SPY (S&P 500) and QQQ (NASDAQ-100) at the same interval as
+    the primary dataframe, aligns them bar-by-bar, then computes per-bar
+    returns and flags when the two indices move in opposite directions.
+
+    A divergence between SPY and QQQ is a mean-reversion signal: historically
+    the two are highly correlated (~0.95), so when they decouple it tends to
+    be transient and one or both revert toward the other.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Primary OHLCV dataframe (already indexed by datetime).
+    period : str
+        yfinance period string matching what was used to download df.
+    interval : str
+        yfinance interval string matching df (e.g. "5m", "1h").
+    min_ret_threshold : float
+        Minimum absolute return for a bar to count as a real move rather
+        than noise. Default 0.05% (0.0005). Bars where either index moves
+        less than this are treated as flat and do not trigger divergence.
+
+    Columns added
+    -------------
+    spy_ret             Bar-over-bar return of SPY, aligned to df index
+    qqq_ret             Bar-over-bar return of QQQ, aligned to df index
+    idx_div_spy_up_qqq_down   SPY up, QQQ down — bearish for tech, bullish macro
+    idx_div_spy_down_qqq_up   SPY down, QQQ up — bullish for tech, bearish macro
+    idx_div_any               Either divergence direction is True
+    idx_div_rolling3          Divergence occurred in any of last 3 bars (persistence flag)
+    idx_corr_20               20-bar rolling correlation between SPY and QQQ returns
+                              (low/negative value = divergence regime is elevated)
+    idx_corr_breakdown        Rolling correlation dropped below 0.5 — regime-level decoupling
+    """
+    # ── Download index data ───────────────────────────────────────────────────
+    try:
+        spy_raw = yf.download("SPY", period=period, interval=interval,
+                              progress=False, auto_adjust=True)
+        qqq_raw = yf.download("QQQ", period=period, interval=interval,
+                              progress=False, auto_adjust=True)
+    except Exception as e:
+        print(f"[index_divergence] Download failed: {e}. Filling features with 0.")
+        for col in ["spy_ret", "qqq_ret", "idx_div_spy_up_qqq_down",
+                    "idx_div_spy_down_qqq_up", "idx_div_any",
+                    "idx_div_rolling3", "idx_corr_20", "idx_corr_breakdown"]:
+            df[col] = 0.0
+        return df
+
+    # Flatten MultiIndex columns if present
+    for raw in (spy_raw, qqq_raw):
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+
+    spy_close = spy_raw["Close"].squeeze()
+    qqq_close = qqq_raw["Close"].squeeze()
+
+    # ── Bar-over-bar returns ──────────────────────────────────────────────────
+    spy_ret = spy_close.pct_change()
+    qqq_ret = qqq_close.pct_change()
+
+    # ── Align to primary df index ─────────────────────────────────────────────
+    # Use reindex + ffill so we handle any minor timestamp mismatches between
+    # the primary ticker and SPY/QQQ (e.g. a few seconds of offset).
+    spy_ret = spy_ret.reindex(df.index, method="ffill")
+    qqq_ret = qqq_ret.reindex(df.index, method="ffill")
+
+    df["spy_ret"] = spy_ret.values
+    df["qqq_ret"] = qqq_ret.values
+
+    # ── Directional divergence flags ─────────────────────────────────────────
+    # A bar counts as a real move only if its absolute return exceeds the
+    # threshold — this filters out flat/noise bars at open/close.
+    spy_up   = (spy_ret >  min_ret_threshold)
+    spy_down = (spy_ret < -min_ret_threshold)
+    qqq_up   = (qqq_ret >  min_ret_threshold)
+    qqq_down = (qqq_ret < -min_ret_threshold)
+
+    # SPY up, QQQ down → macro bid but tech sold off → watch for QQQ reversion up
+    df["idx_div_spy_up_qqq_down"] = (spy_up   & qqq_down).astype(float)
+
+    # SPY down, QQQ up → tech bid but broad market sold off → watch for SPY reversion up
+    # or QQQ reversion down
+    df["idx_div_spy_down_qqq_up"] = (spy_down & qqq_up).astype(float)
+
+    # Either direction
+    df["idx_div_any"] = (
+        df["idx_div_spy_up_qqq_down"] + df["idx_div_spy_down_qqq_up"]
+    ).clip(0, 1)
+
+    # Persistence: did divergence occur in any of the last 3 bars?
+    df["idx_div_rolling3"] = (
+        df["idx_div_any"]
+        .rolling(3, min_periods=1)
+        .max()
+        .astype(float)
+    )
+
+    # ── Rolling correlation ───────────────────────────────────────────────────
+    # Low or negative rolling correlation = indices are meaningfully decoupling.
+    corr = spy_ret.rolling(20, min_periods=10).corr(qqq_ret)
+    corr = corr.reindex(df.index, method="ffill")
+    df["idx_corr_20"] = corr.values
+
+    # Correlation breakdown: rolling corr below 0.5 flags a divergence regime
+    df["idx_corr_breakdown"] = (corr < 0.5).astype(float)
 
     return df
 
@@ -503,13 +501,24 @@ def _add_sweep_fvg_setups(df, sweep_lookback=15, fvg_lookback=30):
 # MAIN ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_features(df: pd.DataFrame) -> pd.DataFrame:
+def build_features(df: pd.DataFrame, period: str = "30d", interval: str = "5m") -> pd.DataFrame:
     """
     Run all feature engineering on a raw OHLCV dataframe.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Raw OHLCV dataframe from yfinance.
+    period : str
+        The period used when downloading df — passed through to
+        _add_index_divergence so SPY/QQQ are downloaded over the same window.
+    interval : str
+        The interval used when downloading df (e.g. "5m").
+
     Returns the enriched dataframe.
     """
     df = df.copy()
-    df = _add_liquidity_sweeps(df)       # must run before _add_sweep_fvg_setups
+    df = _add_liquidity_sweeps(df)
     df = _add_candle_features(df)
     df = _add_structural_trend(df)
     df = _add_adx(df)
@@ -517,9 +526,9 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     df = _add_mean_reversion(df)
     df = _add_momentum(df)
     df = _add_sweep_fvg_setups(df)
+    df = _add_index_divergence(df, period=period, interval=interval)
 
     # Safety net: force every boolean-signal column to float32
-    # so PyTorch never receives a bool or object dtype tensor.
     bool_signal_cols = [c for c in df.columns if c in FEATURES and c != "Close"]
     for col in bool_signal_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce").astype("float32")
@@ -530,10 +539,17 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
 # Feature columns to use as model input (edit here to change for both files)
 FEATURES = [
     "Close",
-    # ── existing entries ──────────────────────────────────────────────────────
-    # ── mean reversion ────────────────────────────────────────────────────────
-    # ── momentum ──────────────────────────────────────────────────────────────
-    "mo_combo_long",
-    "mo_combo_short",
     # ── sweep + FVG setups ────────────────────────────────────────────────────
+    # ── Mean reversion ----────────────────────────────────────────────────────
+    # ── News sentiment ----────────────────────────────────────────────────────
+    "news_bull",
+    "news_bear",
+    "news_sentiment_strong_bull",
+    "news_sentiment_strong_bear",
+    # ── momentum ─────────────────────────────────────────────────────────────
+    # ── index divergence (stat-arb / mean reversion) ─────────────────────────
+    # "idx_div_spy_up_qqq_down",   # SPY up, QQQ down — tech lagging broad market
+    # "idx_div_spy_down_qqq_up",   # SPY down, QQQ up — tech leading, macro lagging
+    # "idx_div_rolling3",         # divergence persisted in last 3 bars
+    # "idx_corr_breakdown"         # SPY/QQQ correlation < 0.5 flags decoupling regime
 ]

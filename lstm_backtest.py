@@ -7,6 +7,9 @@ Usage
 
     # Only predict when at least one signal feature is True on the latest bar
     python lstm_backtest.py --model StockPriceLSTMNetwork_<timestamp>.pt --gate
+
+    # Include news sentiment features (requires FINNHUB_API_KEY env var)
+    python lstm_backtest.py --model StockPriceLSTMNetwork_<timestamp>.pt --sentiment
 """
 
 import argparse
@@ -21,33 +24,72 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import confusion_matrix, classification_report
 
 from feature_engineering import build_features, FEATURES
-from model import StockPriceLSTMNetwork, prepare_price_input, StockPriceLSTMNetworkDualStream
+from model import StockPriceLSTMNetwork, prepare_price_input
 
 warnings.filterwarnings("ignore")
 
 
 TICKER          = "AAPL"
+MODEL_PATH      = "StockPriceLSTMNetwork_2026-06-08_22-11-48.pt"  # ← set this to your .pt file
 WINDOW_SIZE     = 14
 PRED_STEPS      = 14
 THRESHOLD       = 1.0
-GATE_ON_SIGNALS = True   # True → only predict when a signal feature is active
-                          # False → always predict
+GATE_ON_SIGNALS = True
+USE_SENTIMENT   = False   # set True if you have a FINNHUB_API_KEY and want news features
+PERIOD          = "60d"
+INTERVAL        = "5m"
+STEP            = 5       # bars to advance between windows (smaller = more windows, slower)
+SAVE_RESULTS    = "backtest_results.csv"
 
-# Signal features = everything except the first column (Close)
-BOOL_COLS = [f for f in FEATURES if f != "Close"]
+def _get_bool_cols(df: pd.DataFrame) -> list:
+    """
+    Return the boolean feature columns that are both in FEATURES and
+    actually present in df. Sentiment columns are excluded when
+    USE_SENTIMENT=False since they were never added to the dataframe.
+    """
+    return [f for f in FEATURES if f != "Close" and f in df.columns]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1.  DATA
+# 1.  DATA + SENTIMENT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def load_and_prepare_data() -> pd.DataFrame:
-    print(f"[data] Downloading {TICKER} 60d / 5m …")
-    df = yf.download(TICKER, period="60d", interval="5m", progress=False, auto_adjust=True)
+def load_and_prepare_data(use_sentiment: bool = False) -> pd.DataFrame:
+    print(f"[data] Downloading {TICKER} {PERIOD} / {INTERVAL} …")
+    df = yf.download(TICKER, period=PERIOD, interval=INTERVAL,
+                     progress=False, auto_adjust=True)
     df.columns = df.columns.get_level_values(0)
     df.index   = pd.to_datetime(df.index)
-    df         = build_features(df)
-    df         = df.dropna(subset=FEATURES).copy()
+    df         = build_features(df, period=PERIOD, interval=INTERVAL)
+    existing   = [c for c in FEATURES if c in df.columns]
+    df         = df.dropna(subset=existing).copy()
+
+    # ── Sentiment ─────────────────────────────────────────────────────────────
+    # Pre-compute the full sentiment series ONCE here, before the backtest loop.
+    # This is the only correct approach:
+    #   - Computing inside the loop would re-fetch on every window (slow + wrong)
+    #   - The series is aligned bar-by-bar using strict < timestamps,
+    #     so there is zero lookahead even though we compute it upfront
+    if use_sentiment:
+        sentiment_cols = [
+            "news_bull", "news_bear",
+            "news_sentiment_strong_bull", "news_sentiment_strong_bear",
+        ]
+        # Check whether sentiment was already added by build_features
+        if not all(c in df.columns for c in sentiment_cols):
+            try:
+                from news_sentiment import SentimentPipeline
+                pipe = SentimentPipeline(TICKER, days_back=70)  # buffer beyond 60d
+                df   = pipe.add_sentiment_features(df)
+                print(f"[sentiment] Added to backtest dataframe.")
+            except Exception as e:
+                print(f"[sentiment] Could not load — filling with 0. Reason: {e}")
+                for col in sentiment_cols:
+                    if col not in df.columns:
+                        df[col] = 0.0
+        else:
+            print("[sentiment] Sentiment columns already present in dataframe.")
+
     print(f"[data] {len(df)} bars after cleaning")
     return df
 
@@ -57,56 +99,45 @@ def load_and_prepare_data() -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def predict_forward(
-    model:        StockPriceLSTMNetworkDualStream,
-    close_window: np.ndarray,   # (WINDOW_SIZE,)  raw Close prices
+    model:        StockPriceLSTMNetwork,
+    close_window: np.ndarray,   # (WINDOW_SIZE,)  normalised Close prices
     bool_window:  np.ndarray,   # (WINDOW_SIZE,   n_bool) raw 0/1 booleans
     close_scaler: MinMaxScaler,
 ) -> tuple[np.ndarray, str, float]:
     """
     Roll the dual-stream model forward for PRED_STEPS bars.
 
-    For each step:
-      - price stream : prepare_price_input on the current close window
-                       (log-returns, z-scored) — shape (W-1, 1)
-      - bool stream  : last W-1 rows of the bool window — shape (W-1, n_bool)
-      - prediction   : normalised Close for the next bar; inverse-transformed
-                       back to price space for the rolling window update
-
-    Boolean signals are held constant at their last observed values for the
-    multi-step rollout because we have no way to predict future signal states.
-    This is the correct assumption: the model only had past signal state
-    available when it was trained.
+    Sentiment handling in the rollout
+    ----------------------------------
+    Sentiment columns are part of bool_window and are held constant at their
+    last observed value for the multi-step rollout. This is correct: we have
+    no way to predict future news, so the most recent known sentiment state
+    is the best forward estimate. The model learned this pattern during
+    training — sentiment persisting for several bars and then decaying.
     """
     model.eval()
-
-    # Normalise close prices into (-1, 1) to match training
     close_norm = close_scaler.transform(close_window.reshape(-1, 1)).flatten()
 
-    preds_norm  = []
-    cur_close   = close_norm.copy()         # rolling normalised close window
-    last_bools  = bool_window[-1:]          # (1, n_bool) — held constant
+    preds_norm = []
+    cur_close  = close_norm.copy()
+    last_bools = bool_window[-1:]          # (1, n_bool) — held constant
 
     with torch.no_grad():
         for _ in range(PRED_STEPS):
-            # Price input: log-returns over the current close window
             price_t = prepare_price_input(
                 torch.FloatTensor(cur_close)
-            ).unsqueeze(0)                  # (1, W-1, 1)
+            ).unsqueeze(0)                 # (1, W-1, 1)
 
-            # Bool input: repeat last known signal bar for W-1 steps
-            bool_seq = np.repeat(last_bools, len(cur_close) - 1, axis=0)  # (W-1, n_bool)
-            bool_t   = torch.FloatTensor(bool_seq).unsqueeze(0)            # (1, W-1, n_bool)
+            bool_seq = np.repeat(last_bools, len(cur_close) - 1, axis=0)
+            bool_t   = torch.FloatTensor(bool_seq).unsqueeze(0)
 
-            pred_norm = model(price_t, bool_t).item()   # scalar in (-1, 1)
+            pred_norm = model(price_t, bool_t).item()
             preds_norm.append(pred_norm)
-
-            # Slide close window forward by one step
             cur_close = np.append(cur_close[1:], pred_norm)
 
     preds_inv  = close_scaler.inverse_transform(
         np.array(preds_norm).reshape(-1, 1)
     ).flatten()
-
     pct_change = (preds_inv[-1] - preds_inv[0]) / (abs(preds_inv[0]) + 1e-9) * 100
 
     if   pct_change >  THRESHOLD: signal = "BUY"
@@ -117,7 +148,6 @@ def predict_forward(
 
 
 def any_signal_active(bool_window: np.ndarray) -> bool:
-    """True if any boolean feature is non-zero on the latest bar."""
     return bool(np.any(bool_window[-1] != 0))
 
 
@@ -133,18 +163,29 @@ def determine_actual_outcome(actual_closes: np.ndarray) -> str:
 
 
 def run_walk_forward_backtest(
-    model:           StockPriceLSTMNetworkDualStream,
+    model:           StockPriceLSTMNetwork,
     df:              pd.DataFrame,
     close_scaler:    MinMaxScaler,
     step:            int  = 1,
     gate_on_signals: bool = False,
 ) -> pd.DataFrame:
     """
-    gate_on_signals=True  — model only predicts when at least one boolean
-                            signal feature is True on the latest bar.
-                            Skipped windows are recorded as HOLD.
-    gate_on_signals=False — model always predicts (original behaviour).
+    Walk-forward backtest.
+
+    Sentiment note
+    --------------
+    If sentiment columns are present in df (because --sentiment was passed),
+    they are already in BOOL_COLS and flow through naturally as part of
+    bool_window at each step. No special handling needed inside the loop —
+    the pre-computation in load_and_prepare_data already ensured each bar's
+    sentiment score only uses articles published before that bar.
+
+    The only backtest-specific consideration is the close_scaler: it is
+    loaded from the training checkpoint (fitted on training data), NOT
+    re-fitted on the backtest window. Re-fitting would be a form of lookahead
+    because the scaler would have seen future prices.
     """
+    BOOL_COLS  = _get_bool_cols(df)
     close_vals = df["Close"].values.astype(float)
     bool_vals  = df[BOOL_COLS].values.astype(float)
     dates      = df.index
@@ -155,13 +196,20 @@ def run_walk_forward_backtest(
     total     = len(range(min_start, max_start, step))
     skipped   = 0
 
-    mode_label = "gated (signal required)" if gate_on_signals else "always predict"
-    print(f"[backtest] {total} windows  |  step={step}  |  mode={mode_label} …")
+    mode_label = "gated" if gate_on_signals else "always predict"
+    print(f"[backtest] {total} windows  |  step={step}  |  mode={mode_label}")
+
+    # Log which sentiment bars are active across the full dataset
+    sentiment_cols = [c for c in BOOL_COLS if c.startswith("news_")]
+    if sentiment_cols:
+        for col in sentiment_cols:
+            rate = bool_vals[:, BOOL_COLS.index(col)].mean()
+            print(f"[sentiment] {col:<35} firing rate: {rate:.3f}")
 
     for idx, i in enumerate(range(min_start, max_start, step)):
 
-        close_window  = close_vals[i - WINDOW_SIZE : i]    # (W,)
-        bool_window   = bool_vals [i - WINDOW_SIZE : i]    # (W, n_bool)
+        close_window  = close_vals[i - WINDOW_SIZE : i]
+        bool_window   = bool_vals [i - WINDOW_SIZE : i]
         actual_window = close_vals[i : i + PRED_STEPS]
 
         entry_date    = dates[i]
@@ -188,6 +236,9 @@ def run_walk_forward_backtest(
                 "correct":        actual_outcome == "HOLD",
                 "pnl_pct":        0.0,
                 "gated_out":      True,
+                # Surface which sentiment signals were active at entry
+                **{col: bool(bool_window[-1, BOOL_COLS.index(col)])
+                   for col in sentiment_cols},
             })
             continue
 
@@ -223,19 +274,22 @@ def run_walk_forward_backtest(
             "correct":        signal == actual_outcome,
             "pnl_pct":        round(pnl_pct, 4),
             "gated_out":      False,
+            # Surface which sentiment signals were active at entry
+            **{col: bool(bool_window[-1, BOOL_COLS.index(col)])
+               for col in sentiment_cols},
         })
 
         if (idx + 1) % 50 == 0:
             print(f"  … {idx + 1}/{total} done")
 
     if gate_on_signals:
-        print(f"[backtest] {skipped}/{total} windows skipped (no signal active)")
+        print(f"[backtest] {skipped}/{total} windows skipped (no signal)")
     print(f"[backtest] Complete — {len(results)} windows recorded.\n")
     return pd.DataFrame(results)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4.  METRICS
+# 4.  METRICS  (+ sentiment breakdown)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_and_print_metrics(results: pd.DataFrame) -> dict:
@@ -289,31 +343,31 @@ def compute_and_print_metrics(results: pd.DataFrame) -> dict:
     present = sorted(set(y_true) | set(y_pred))
 
     if len(y_true) == 0:
-        print("[warn] No windows were predicted — all were gated out.")
+        print("[warn] No windows were predicted.")
         return {}
 
     gated_count = int(results["gated_out"].sum())
 
-    w = 55
+    w = 60
     print("\n" + "═" * w)
     print("  LSTM WALK-FORWARD BACKTEST  —  PERFORMANCE REPORT")
     print("═" * w)
-    print(f"\n  Dataset  : {TICKER} · 60d · 5-minute bars")
-    print(f"  Windows  : {total}  |  Predicted: {len(predicted)}  |  Gated out: {gated_count}")
+    print(f"\n  Dataset  : {TICKER} · {PERIOD} · {INTERVAL} bars")
+    print(f"  Windows  : {total}  |  Predicted: {len(predicted)}  |  Gated: {gated_count}")
     print(f"  Look-back: {WINDOW_SIZE}  |  Horizon: {PRED_STEPS}  |  Threshold: ±{THRESHOLD}%")
 
     print(f"\n  ── Signal Distribution {'─' * (w - 25)}")
     for lbl in ["BUY", "HOLD", "SELL"]:
-        print(f"    {lbl:<6}  predicted: {sig_counts.get(lbl, 0):>5}   actual: {act_counts.get(lbl, 0):>5}")
+        print(f"    {lbl:<6}  predicted: {sig_counts.get(lbl,0):>5}   actual: {act_counts.get(lbl,0):>5}")
 
-    print(f"\n  ── Accuracy (predicted windows only) {'─' * (w - 39)}")
-    print(f"    Overall accuracy (3-class)    : {overall_acc:>6.1f} %")
-    print(f"    Directional accuracy (no HOLD): {dir_acc:>6.1f} %")
-    print(f"    BUY  signal accuracy          : {buy_acc:>6.1f} %")
-    print(f"    SELL signal accuracy          : {sell_acc:>6.1f} %")
-    print(f"    HOLD signal accuracy          : {hold_acc:>6.1f} %")
+    print(f"\n  ── Accuracy {'─' * (w - 14)}")
+    print(f"    Overall (3-class)      : {overall_acc:>6.1f} %")
+    print(f"    Directional (no HOLD)  : {dir_acc:>6.1f} %")
+    print(f"    BUY  accuracy          : {buy_acc:>6.1f} %")
+    print(f"    SELL accuracy          : {sell_acc:>6.1f} %")
+    print(f"    HOLD accuracy          : {hold_acc:>6.1f} %")
 
-    print(f"\n  ── P&L (non-HOLD trades, 0.1% commission/side) {'─' * (w - 49)}")
+    print(f"\n  ── P&L (0.1% commission/side) {'─' * (w - 32)}")
     print(f"    Trades taken      : {len(traded):>6}")
     print(f"    Win rate          : {win_rate:>6.1f} %")
     print(f"    Avg win           : {avg_win:>+6.3f} %")
@@ -323,6 +377,36 @@ def compute_and_print_metrics(results: pd.DataFrame) -> dict:
     print(f"    Total P&L (sum)   : {total_pnl:>+6.2f} %")
     print(f"    Cumulative return : {cum_return:>+6.2f} %")
     print(f"    Max drawdown      : {max_dd:>+6.2f} %")
+
+    # ── Sentiment breakdown (only shown when sentiment cols exist) ────────────
+    sentiment_cols = [c for c in results.columns if c.startswith("news_")]
+    if sentiment_cols and len(traded) > 0:
+        print(f"\n  ── Sentiment Breakdown {'─' * (w - 25)}")
+        print(f"    Win rate when news_bull active     : ", end="")
+        if "news_bull" in results.columns:
+            bull_trades = traded[traded["news_bull"] == True]
+            if len(bull_trades):
+                bull_wr = (bull_trades["pnl_pct"] > 0).mean() * 100
+                print(f"{bull_wr:.1f}%  ({len(bull_trades)} trades)")
+            else:
+                print("no trades")
+        print(f"    Win rate when news_bear active     : ", end="")
+        if "news_bear" in results.columns:
+            bear_trades = traded[traded["news_bear"] == True]
+            if len(bear_trades):
+                bear_wr = (bear_trades["pnl_pct"] > 0).mean() * 100
+                print(f"{bear_wr:.1f}%  ({len(bear_trades)} trades)")
+            else:
+                print("no trades")
+        print(f"    Win rate with no sentiment signal  : ", end="")
+        no_sent = traded[
+            (traded.get("news_bull", pd.Series(False, index=traded.index)) == False) &
+            (traded.get("news_bear", pd.Series(False, index=traded.index)) == False)
+        ]
+        if len(no_sent):
+            print(f"{(no_sent['pnl_pct'] > 0).mean()*100:.1f}%  ({len(no_sent)} trades)")
+        else:
+            print("no trades")
 
     print(f"\n  ── Confusion Matrix {'─' * (w - 22)}")
     cm     = confusion_matrix(y_true, y_pred, labels=present)
@@ -359,32 +443,34 @@ def compute_and_print_metrics(results: pd.DataFrame) -> dict:
 # 5.  MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument("--model",        required=True,  help="Path to .pt checkpoint")
-    p.add_argument("--step",         type=int, default=5)
-    p.add_argument("--gate",         action="store_true", help="Gate predictions on signal activity")
-    p.add_argument("--save_results", default="backtest_results.csv")
-    return p.parse_args()
-
-
 def main():
-    args = parse_args()
-    gate = args.gate or GATE_ON_SIGNALS
+    gate = GATE_ON_SIGNALS
 
-    df = load_and_prepare_data()
+    df        = load_and_prepare_data(use_sentiment=USE_SENTIMENT)
+    bool_cols = _get_bool_cols(df)   # resolve after df is built
 
-    # ── Load checkpoint ───────────────────────────────────────────────────────
-    # The training script saves a dict with architecture params and the scaler.
-    # We use those to reconstruct the model exactly as trained.
-    print(f"[model] Loading from {args.model} …")
-    ckpt = torch.load(args.model, map_location="cpu", weights_only=False)
+    print(f"[model] Loading from {MODEL_PATH} …")
+    ckpt = torch.load(MODEL_PATH, map_location="cpu", weights_only=False)
+
+    # ── Validate feature alignment ────────────────────────────────────────────
+    ckpt_bool_cols = ckpt.get("bool_cols", None)
+    if ckpt_bool_cols is not None and ckpt_bool_cols != bool_cols:
+        missing  = set(ckpt_bool_cols) - set(bool_cols)
+        extra    = set(bool_cols) - set(ckpt_bool_cols)
+        msg = (
+            f"\n[error] FEATURES mismatch between checkpoint and current feature_engineering.py\n"
+            f"  In checkpoint but not in current FEATURES : {missing or 'none'}\n"
+            f"  In current FEATURES but not in checkpoint : {extra or 'none'}\n"
+            f"\n  → If you added sentiment features after training, retrain the model first.\n"
+            f"  → Or remove the new features from FEATURES to match the checkpoint."
+        )
+        raise ValueError(msg)
 
     n_bool       = ckpt["n_bool_features"]
     hidden_size  = ckpt["hidden_size"]
-    close_scaler = ckpt["close_scaler"]     # fitted MinMaxScaler from training
+    close_scaler = ckpt["close_scaler"]
 
-    model = StockPriceLSTMNetworkDualStream(
+    model = StockPriceLSTMNetwork(
         n_bool_features = n_bool,
         hidden_size     = hidden_size,
         output_size     = 1,
@@ -395,13 +481,13 @@ def main():
 
     results = run_walk_forward_backtest(
         model, df, close_scaler,
-        step            = args.step,
+        step            = STEP,
         gate_on_signals = gate,
     )
     metrics = compute_and_print_metrics(results)
 
-    results.to_csv(args.save_results, index=False)
-    print(f"[output] Results saved → {args.save_results}")
+    results.to_csv(SAVE_RESULTS, index=False)
+    print(f"[output] Results saved → {SAVE_RESULTS}")
     return results, metrics
 
 

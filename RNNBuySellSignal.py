@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import datetime
 from sklearn.preprocessing import MinMaxScaler
+from news_sentiment import SentimentPipeline
 from feature_engineering import build_features, FEATURES
 from model import StockPriceLSTMNetwork, DirectionalLoss, prepare_price_input, StockPriceLSTMNetworkDualStream
 
@@ -11,7 +12,7 @@ from model import StockPriceLSTMNetwork, DirectionalLoss, prepare_price_input, S
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
-TICKER      = "AAPL"
+TICKER      = "SPY"
 WINDOW_SIZE = 14
 EPOCHS      = 200
 HIDDEN_SIZE = 64
@@ -21,10 +22,13 @@ LR          = 0.001
 # DATA
 # ─────────────────────────────────────────────────────────────────────────────
 
+pipe = SentimentPipeline(TICKER, days_back=35)
+
 df = yf.download(TICKER, period="30d", interval="5m", progress=False)
 df.columns = df.columns.get_level_values(0)
 df.index   = pd.to_datetime(df.index)
-df         = build_features(df)
+df         = build_features(df, period = "30d", interval = "5m")
+df = pipe.add_sentiment_features(df)
 
 assert FEATURES[0] == "Close", "FEATURES[0] must be 'Close'."
 
