@@ -24,18 +24,18 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import confusion_matrix, classification_report
 
 from feature_engineering import build_features, FEATURES
-from model import StockPriceLSTMNetwork, prepare_price_input
+from model import StockPriceLSTMNetwork, prepare_price_input, StockPriceLSTMNetworkDualStream
 
 warnings.filterwarnings("ignore")
 
 
-TICKER          = "AAPL"
-MODEL_PATH      = "StockPriceLSTMNetwork_2026-06-08_22-11-48.pt"  # ← set this to your .pt file
+TICKER          = "SPY"
+MODEL_PATH      = "StockPriceLSTMNetwork_2026-06-09_13-11-55.pt"  # ← set this to your .pt file
 WINDOW_SIZE     = 14
 PRED_STEPS      = 14
 THRESHOLD       = 1.0
 GATE_ON_SIGNALS = True
-USE_SENTIMENT   = False   # set True if you have a FINNHUB_API_KEY and want news features
+USE_SENTIMENT   = True   # set True if you have a FINNHUB_API_KEY and want news features
 PERIOD          = "60d"
 INTERVAL        = "5m"
 STEP            = 5       # bars to advance between windows (smaller = more windows, slower)
@@ -99,7 +99,7 @@ def load_and_prepare_data(use_sentiment: bool = False) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def predict_forward(
-    model:        StockPriceLSTMNetwork,
+    model:        StockPriceLSTMNetworkDualStream,
     close_window: np.ndarray,   # (WINDOW_SIZE,)  normalised Close prices
     bool_window:  np.ndarray,   # (WINDOW_SIZE,   n_bool) raw 0/1 booleans
     close_scaler: MinMaxScaler,
@@ -163,7 +163,7 @@ def determine_actual_outcome(actual_closes: np.ndarray) -> str:
 
 
 def run_walk_forward_backtest(
-    model:           StockPriceLSTMNetwork,
+    model:           StockPriceLSTMNetworkDualStream,
     df:              pd.DataFrame,
     close_scaler:    MinMaxScaler,
     step:            int  = 1,
@@ -470,7 +470,7 @@ def main():
     hidden_size  = ckpt["hidden_size"]
     close_scaler = ckpt["close_scaler"]
 
-    model = StockPriceLSTMNetwork(
+    model = StockPriceLSTMNetworkDualStream(
         n_bool_features = n_bool,
         hidden_size     = hidden_size,
         output_size     = 1,

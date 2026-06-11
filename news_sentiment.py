@@ -305,27 +305,36 @@ class SentimentPipeline:
         article_count   = np.zeros(len(df), dtype=int)
 
         if not news.empty:
-            news_times = news["datetime"].values          # numpy datetime64[ns, UTC]
             news_scores = news["sentiment_score"].values  # float array
 
-            bar_times  = idx.values   # numpy datetime64 array
+            # Convert everything to plain integer nanoseconds (UTC) for comparison.
+            # Mixing tz-aware pandas Timestamps with numpy datetime64 produces
+            # silent type mismatches that make every mask evaluate to False.
+            # int64 ns-since-epoch is unambiguous regardless of how yfinance
+            # or Finnhub chose to encode their timestamps.
+            news_times_ns = (
+                news["datetime"]
+                .dt.tz_convert("UTC")
+                .astype("int64")
+                .values
+            )
+            bar_times_ns = idx.asi8   # int64 nanoseconds since epoch, always UTC
 
-            # For each bar, find all articles published before it (no lookahead)
-            # and compute an exponentially-weighted mean (half-life = 4 hours on 5m bars)
-            # 4 hours = 48 five-minute bars → lambda = 1 - exp(-ln2/48) ≈ 0.0142
+            # Half-life = 4 hours = 48 five-minute bars
             decay = 1.0 - np.exp(-np.log(2) / 48)
+            ns_per_5min = 5 * 60 * 1_000_000_000   # nanoseconds in one 5m bar
 
-            for i, bar_t in enumerate(bar_times):
-                # Articles published strictly before this bar
-                mask = news_times < bar_t
+            for i, bar_ns in enumerate(bar_times_ns):
+                # Articles published strictly before this bar's open
+                mask = news_times_ns < bar_ns
                 if not mask.any():
                     continue
 
                 art_scores = news_scores[mask]
-                art_times  = news_times[mask]
+                art_ns     = news_times_ns[mask]
 
-                # Time deltas in 5-minute units (most recent = smallest delta)
-                deltas = (bar_t - art_times).astype("timedelta64[m]").astype(float) / 5.0
+                # Time deltas in 5-minute units (all integer arithmetic — no tz issues)
+                deltas = (bar_ns - art_ns) / ns_per_5min   # float array
 
                 # Exponential weights: more recent → higher weight
                 weights = np.exp(-decay * deltas)
@@ -356,7 +365,7 @@ class SentimentPipeline:
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--ticker",  default="SPY", help="Stock ticker (default: SPY)")
+    p.add_argument("--ticker",  default="AAPL")
     p.add_argument("--days",    type=int, default=7)
     p.add_argument("--api_key", default=None)
     return p.parse_args()

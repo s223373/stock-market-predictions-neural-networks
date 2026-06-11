@@ -548,8 +548,8 @@ FEATURES = [
     "news_sentiment_strong_bear",
     # ── momentum ─────────────────────────────────────────────────────────────
     # ── index divergence (stat-arb / mean reversion) ─────────────────────────
-    # "idx_div_spy_up_qqq_down",   # SPY up, QQQ down — tech lagging broad market
-    # "idx_div_spy_down_qqq_up",   # SPY down, QQQ up — tech leading, macro lagging
-    # "idx_div_rolling3",         # divergence persisted in last 3 bars
-    # "idx_corr_breakdown"         # SPY/QQQ correlation < 0.5 flags decoupling regime
+    "idx_div_spy_up_qqq_down",   # SPY up, QQQ down — tech lagging broad market
+    "idx_div_spy_down_qqq_up",   # SPY down, QQQ up — tech leading, macro lagging
+    "idx_div_rolling3",         # divergence persisted in last 3 bars
+    "idx_corr_breakdown"         # SPY/QQQ correlation < 0.5 flags decoupling regime
 ]
