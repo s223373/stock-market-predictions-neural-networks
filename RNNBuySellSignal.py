@@ -27,8 +27,8 @@ pipe = SentimentPipeline(TICKER, days_back=35)
 df = yf.download(TICKER, period="30d", interval="5m", progress=False)
 df.columns = df.columns.get_level_values(0)
 df.index   = pd.to_datetime(df.index)
-df         = build_features(df, period = "30d", interval = "5m")
-df = pipe.add_sentiment_features(df)
+df         = build_features(df, period="30d", interval="5m")
+df         = pipe.add_sentiment_features(df)
 
 assert FEATURES[0] == "Close", "FEATURES[0] must be 'Close'."
 
@@ -52,8 +52,8 @@ close_norm   = close_scaler.fit_transform(close_vals.reshape(-1, 1)).flatten().a
 assert not np.isnan(close_norm).any(), "NaN in close_norm after scaling"
 print(f"[data] Scaled close range: [{close_norm.min():.4f}, {close_norm.max():.4f}]")
 
-close_tensor = torch.from_numpy(close_norm)          # float32
-bool_tensor  = torch.from_numpy(bool_vals)           # float32
+close_tensor = torch.from_numpy(close_norm)   # float32
+bool_tensor  = torch.from_numpy(bool_vals)    # float32
 n_bool       = len(bool_cols)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -96,6 +96,9 @@ optimizer = torch.optim.Adam(model.parameters(), lr=LR)
 # ─────────────────────────────────────────────────────────────────────────────
 # TRAINING LOOP
 # ─────────────────────────────────────────────────────────────────────────────
+
+best_loss  = float("inf")
+best_state = None
 
 model.train()
 for epoch in range(EPOCHS):
@@ -151,17 +154,25 @@ for epoch in range(EPOCHS):
         break
 
     avg_loss = epoch_loss / len(train_data)
+
+    # Track best checkpoint
+    if avg_loss < best_loss:
+        best_loss  = avg_loss
+        best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
     if (epoch + 1) % 10 == 0:
-        print(f"Epoch {epoch+1:3}  Avg Loss: {avg_loss:.8f}")
+        print(f"Epoch {epoch+1:3}  Avg Loss: {avg_loss:.8f}  Best: {best_loss:.8f}")
 
 else:
     # ─────────────────────────────────────────────────────────────────────────
     # SAVE  (only reached if training completed without NaN)
+    # Saves the best checkpoint (lowest avg loss), not the final epoch.
+    # alpaca_trader.py loads this same dict — keep keys in sync.
     # ─────────────────────────────────────────────────────────────────────────
     now       = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     save_path = f"StockPriceLSTMNetwork_{now}.pt"
     torch.save({
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": best_state,   # best epoch, not last
         "n_bool_features":  n_bool,
         "hidden_size":      HIDDEN_SIZE,
         "bool_cols":        bool_cols,
@@ -169,3 +180,4 @@ else:
         "window_size":      WINDOW_SIZE,
     }, save_path)
     print(f"\nModel saved → {save_path}")
+    print(f"Best avg loss: {best_loss:.8f}")

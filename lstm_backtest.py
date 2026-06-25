@@ -30,7 +30,7 @@ warnings.filterwarnings("ignore")
 
 
 TICKER          = "SPY"
-MODEL_PATH      = "StockPriceLSTMNetwork_2026-06-09_13-11-55.pt"  # ← set this to your .pt file
+MODEL_PATH      = "StockPriceLSTMNetwork_2026-06-24_15-57-25.pt"  # ← set this to your .pt file
 WINDOW_SIZE     = 14
 PRED_STEPS      = 14
 THRESHOLD       = 1.0
