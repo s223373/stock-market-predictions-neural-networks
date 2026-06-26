@@ -561,87 +561,87 @@ FEATURES = [
     # ── continuous price ───────────────────────────────────────────────────
     "Close",
 
-    # # ── liquidity sweeps  (_add_liquidity_sweeps) ──────────────────────────
-    # "prev_day_high",       # previous session high (price level)
-    # "prev_day_low",        # previous session low  (price level)
-    # "high_wick_sweep",     # wick pierced prev high but closed below it
-    # "low_wick_sweep",      # wick pierced prev low  but closed above it
+    # ── liquidity sweeps  (_add_liquidity_sweeps) ──────────────────────────
+    "prev_day_high",       # previous session high (price level)
+    "prev_day_low",        # previous session low  (price level)
+    "high_wick_sweep",     # wick pierced prev high but closed below it
+    "low_wick_sweep",      # wick pierced prev low  but closed above it
 
-    # # ── candle direction  (_add_candle_features) ───────────────────────────
-    # "isGreen",             # close > open
-    # "isHigh",              # green candle AND higher close than prior bar
-    # "isLow",               # red candle AND lower close than prior bar
+    # ── candle direction  (_add_candle_features) ───────────────────────────
+    "isGreen",             # close > open
+    "isHigh",              # green candle AND higher close than prior bar
+    "isLow",               # red candle AND lower close than prior bar
 
-    # # ── structural trend  (_add_structural_trend) ──────────────────────────
-    # # drop_first=True drops "trend_downtrend" (alphabetically first).
-    # # Encoding: downtrend → (trend_ranging=0, trend_uptrend=0)
-    # "trend_ranging",
-    # "trend_uptrend",
+    # ── structural trend  (_add_structural_trend) ──────────────────────────
+    # drop_first=True drops "trend_downtrend" (alphabetically first).
+    # Encoding: downtrend → (trend_ranging=0, trend_uptrend=0)
+    "trend_ranging",
+    "trend_uptrend",
 
-    # # ── ADX trend strength  (_add_adx) ────────────────────────────────────
-    # "ADX",
-    # "DMP",                    # +DI
-    # "DMN",                    # -DI
-    # "is_trending",            # ADX > 25
-    # "adx_uptrend",            # ADX > 25 AND +DI > -DI
-    # "adx_downtrend",          # ADX > 25 AND -DI > +DI
-    # "DI_cross_up",            # +DI just crossed above -DI this bar
-    # "DI_cross_down",          # -DI just crossed above +DI this bar
-    # "ADX_slope",              # 3-bar change in ADX
-    # "trend_strengthening",    # ADX slope > 0
-    # "trend_weakening",        # ADX slope < 0
-    # "strong_up",              # adx_uptrend AND strengthening
-    # "fading_up",              # adx_uptrend AND weakening
-    # "strong_down",            # adx_downtrend AND strengthening
-    # "fading_down",            # adx_downtrend AND weakening
+    # ── ADX trend strength  (_add_adx) ────────────────────────────────────
+    "ADX",
+    "DMP",                    # +DI
+    "DMN",                    # -DI
+    "is_trending",            # ADX > 25
+    "adx_uptrend",            # ADX > 25 AND +DI > -DI
+    "adx_downtrend",          # ADX > 25 AND -DI > +DI
+    "DI_cross_up",            # +DI just crossed above -DI this bar
+    "DI_cross_down",          # -DI just crossed above +DI this bar
+    "ADX_slope",              # 3-bar change in ADX
+    "trend_strengthening",    # ADX slope > 0
+    "trend_weakening",        # ADX slope < 0
+    "strong_up",              # adx_uptrend AND strengthening
+    "fading_up",              # adx_uptrend AND weakening
+    "strong_down",            # adx_downtrend AND strengthening
+    "fading_down",            # adx_downtrend AND weakening
 
-    # # ── MACD + Linear Regression Channel  (_add_macd_lr) ──────────────────
-    # "macd_line",
-    # "macd_signal",
-    # "macd_hist",
-    # "lr_upper",               # LR midline + 4σ
-    # "lr_lower",               # LR midline − 4σ
-    # "near_upper_band",        # close ≥ midline + 0.8×dev (strong bullish)
-    # "near_lower_band",        # close ≤ midline − 0.8×dev (strong bearish)
-    # "touches_upper",          # close ≥ upper band (stretched)
-    # "touches_lower",          # close ≤ lower band (compressed)
-    # "broke_above",            # just crossed above upper band
-    # "broke_below",            # just crossed below lower band
-    # "bands_widening",         # band width > width 3 bars ago
-    # "bands_narrowing",        # band width < width 3 bars ago
-    # "macd_bullish_entry",     # MACD cross up while near lower band
-    # "macd_bearish_entry",     # MACD cross down while near upper band
-    # "rsi",
-    # "rsi_overbought",         # RSI > 70
-    # "rsi_oversold",           # RSI < 30
+    # ── MACD + Linear Regression Channel  (_add_macd_lr) ──────────────────
+    "macd_line",
+    "macd_signal",
+    "macd_hist",
+    "lr_upper",               # LR midline + 4σ
+    "lr_lower",               # LR midline − 4σ
+    "near_upper_band",        # close ≥ midline + 0.8×dev (strong bullish)
+    "near_lower_band",        # close ≤ midline − 0.8×dev (strong bearish)
+    "touches_upper",          # close ≥ upper band (stretched)
+    "touches_lower",          # close ≤ lower band (compressed)
+    "broke_above",            # just crossed above upper band
+    "broke_below",            # just crossed below lower band
+    "bands_widening",         # band width > width 3 bars ago
+    "bands_narrowing",        # band width < width 3 bars ago
+    "macd_bullish_entry",     # MACD cross up while near lower band
+    "macd_bearish_entry",     # MACD cross down while near upper band
+    "rsi",
+    "rsi_overbought",         # RSI > 70
+    "rsi_oversold",           # RSI < 30
 
-    # # ── mean reversion  (_add_mean_reversion) ─────────────────────────────
-    # "mr_below_sma20",
-    # "mr_above_sma20",
-    # "mr_bb_below_lower",      # below lower Bollinger Band (2σ)
-    # "mr_bb_above_upper",      # above upper Bollinger Band (2σ)
-    # "mr_rsi_oversold",
-    # "mr_rsi_overbought",
-    # "mr_z_score_low",         # Z-score < −1.5
-    # "mr_z_score_high",        # Z-score >  1.5
-    # "mr_below_vwap",
-    # "mr_above_vwap",
+    # ── mean reversion  (_add_mean_reversion) ─────────────────────────────
+    "mr_below_sma20",
+    "mr_above_sma20",
+    "mr_bb_below_lower",      # below lower Bollinger Band (2σ)
+    "mr_bb_above_upper",      # above upper Bollinger Band (2σ)
+    "mr_rsi_oversold",
+    "mr_rsi_overbought",
+    "mr_z_score_low",         # Z-score < −1.5
+    "mr_z_score_high",        # Z-score >  1.5
+    "mr_below_vwap",
+    "mr_above_vwap",
 
-    # # ── momentum  (_add_momentum) ──────────────────────────────────────────
-    # "mo_roc_positive_20",     # 20-bar rate-of-change > 0
-    # "mo_roc_negative_20",
-    # "mo_golden_cross",        # SMA50 just crossed above SMA200
-    # "mo_death_cross",
-    # "mo_macd_cross_up",
-    # "mo_macd_cross_down",
-    # "mo_adx_trending",        # ADX > 25
-    # "mo_breakout_high20",     # close > 20-bar rolling high (no lookahead)
-    # "mo_breakdown_low20",
-    # "mo_volume_surge",        # volume > 2× 20-bar average
-    # "mo_consecutive_up3",     # 3+ consecutive green bars
-    # "mo_consecutive_down3",
-    # "mo_combo_long",          # ≥2 of 5 bullish momentum signals firing
-    # "mo_combo_short",
+    # ── momentum  (_add_momentum) ──────────────────────────────────────────
+    "mo_roc_positive_20",     # 20-bar rate-of-change > 0
+    "mo_roc_negative_20",
+    "mo_golden_cross",        # SMA50 just crossed above SMA200
+    "mo_death_cross",
+    "mo_macd_cross_up",
+    "mo_macd_cross_down",
+    "mo_adx_trending",        # ADX > 25
+    "mo_breakout_high20",     # close > 20-bar rolling high (no lookahead)
+    "mo_breakdown_low20",
+    "mo_volume_surge",        # volume > 2× 20-bar average
+    "mo_consecutive_up3",     # 3+ consecutive green bars
+    "mo_consecutive_down3",
+    "mo_combo_long",          # ≥2 of 5 bullish momentum signals firing
+    "mo_combo_short",
 
     # ── ICT liquidity sweep → FVG setups  (_add_sweep_fvg_setups) ─────────
     "fvg_bull_top",           # top of active bullish FVG (NaN = no active zone)
@@ -657,15 +657,15 @@ FEATURES = [
     "setup_bull_confirmed",   # sweep+FVG setup confirmed by green candle
     "setup_bear_confirmed",
 
-    # # ── SPY / QQQ index divergence  (_add_index_divergence) ───────────────
-    # "spy_ret",                # SPY bar-over-bar return
-    # "qqq_ret",                # QQQ bar-over-bar return
-    # "idx_div_spy_up_qqq_down",
-    # "idx_div_spy_down_qqq_up",
-    # "idx_div_any",
-    # "idx_div_rolling3",       # divergence persisted in any of last 3 bars
-    # "idx_corr_20",            # 20-bar rolling SPY/QQQ correlation
-    # "idx_corr_breakdown",     # rolling correlation < 0.5 (regime decoupling)
+    # ── SPY / QQQ index divergence  (_add_index_divergence) ───────────────
+    "spy_ret",                # SPY bar-over-bar return
+    "qqq_ret",                # QQQ bar-over-bar return
+    "idx_div_spy_up_qqq_down",
+    "idx_div_spy_down_qqq_up",
+    "idx_div_any",
+    "idx_div_rolling3",       # divergence persisted in any of last 3 bars
+    "idx_corr_20",            # 20-bar rolling SPY/QQQ correlation
+    "idx_corr_breakdown",     # rolling correlation < 0.5 (regime decoupling)
 
     # ── FinBERT / Finnhub news sentiment  (step 3 — optional) ─────────────
     # Only present when USE_NEWS_SENTIMENT = True.
