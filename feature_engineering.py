@@ -384,6 +384,314 @@ def _add_sweep_fvg_setups(df, sweep_lookback=15, fvg_lookback=30):
 
     return df
 
+def _add_fvg_stack_features(
+    df: pd.DataFrame,
+    stack_lookback: int = 50,
+    target_expire_bars: int = 30,
+) -> pd.DataFrame:
+    """
+    ICT FVG Stack and Sequential Inversion Targeting.
+
+    Concept
+    -------
+    After an impulse move, multiple FVGs stack in the direction of that
+    move.  When price retraces into the NEAREST FVG and *inverses* it
+    (close breaks through the zone's bottom/top, flipping demand ↔ supply),
+    it strongly signals continuation of the retrace toward the NEXT FVG in
+    the stack.
+
+    This function maintains an ordered stack of ALL active FVGs (vs the
+    single-FVG tracking in _add_sweep_fvg_setups) and emits inversion and
+    sequential-targeting signals.
+
+    Ordering convention
+    -------------------
+    Bull FVGs (demand zones from up-impulse gaps) sorted DESCENDING by bot
+    → highest demand zone = nearest when price retraces downward.
+    Bear FVGs (supply zones from down-impulse gaps) sorted ASCENDING by bot
+    → lowest supply zone = nearest when price retraces upward.
+
+    Touched / Inversion / Arrival rules
+    ------------------------------------
+    - "Touched" = any bar *after creation* whose wick enters the zone
+      (low <= fvg_top for bull; high >= fvg_bot for bear).
+    - "Inversion" = touched FVG broken on a close basis
+      (close < fvg_bot for bull; close > fvg_top for bear).
+    - "Arrival" = during targeting state, wick enters the target zone AND
+      close holds inside it (l <= tgt_top and c >= tgt_bot for bull;
+      h >= tgt_bot and c <= tgt_top for bear).
+    - Targeting fires with a one-bar lag after inversion so the signal is
+      strictly forward-looking.
+    - Targeting auto-resets after target_expire_bars or on arrival.
+
+    FVG expiry
+    ----------
+    A FVG is removed when (a) close breaks through its bot/top (inversed),
+    or (b) it is older than stack_lookback bars.
+
+    Parameters
+    ----------
+    df                 : OHLCV DataFrame with DatetimeIndex.
+    stack_lookback     : Max age (bars) of FVGs kept in the stack.
+    target_expire_bars : Bars before a targeting state auto-resets.
+
+    Columns added
+    -------------
+    fvg_bull_stack_count     # active bull FVGs remaining in stack
+    fvg_bear_stack_count     # active bear FVGs remaining in stack
+    fvg_impulse_up_count     bull FVGs created in last stack_lookback bars
+    fvg_impulse_dn_count     bear FVGs created in last stack_lookback bars
+
+    fvg_near_bull_top        price: top of nearest active bull FVG
+    fvg_near_bull_bot        price: bottom of nearest active bull FVG
+    fvg_near_bull_size       gap width (top − bot) of nearest bull FVG
+    fvg_near_bull_mid        midpoint of nearest bull FVG
+    fvg_near_bear_top        price: top of nearest active bear FVG
+    fvg_near_bear_bot        price: bottom of nearest active bear FVG
+    fvg_near_bear_size       gap width of nearest bear FVG
+    fvg_near_bear_mid        midpoint of nearest bear FVG
+
+    fvg_next_bull_top        price: top of the 2nd bull FVG in the stack
+    fvg_next_bull_bot        price: bottom of the 2nd bull FVG
+    fvg_next_bear_top        price: top of the 2nd bear FVG in the stack
+    fvg_next_bear_bot        price: bottom of the 2nd bear FVG
+
+    fvg_target_bull_top      price: top of the FVG currently targeted (bull)
+    fvg_target_bull_bot      price: bottom of the targeted bull FVG
+    fvg_target_bear_top      price: top of the FVG currently targeted (bear)
+    fvg_target_bear_bot      price: bottom of the targeted bear FVG
+
+    fvg_bull_inversion       1 when nearest bull FVG inversed (close < bot)
+    fvg_bear_inversion       1 when nearest bear FVG inversed (close > top)
+    fvg_bull_stacking        1 if ≥2 active bull FVGs (impulse regime)
+    fvg_bear_stacking        1 if ≥2 active bear FVGs
+
+    fvg_targeting_next_bull  1 while in post-bull-inversion targeting state
+    fvg_targeting_next_bear  1 while in post-bear-inversion targeting state
+    fvg_at_next_bull         1 when price first arrives at next bull FVG target
+    fvg_at_next_bear         1 when price first arrives at next bear FVG target
+
+    fvg_dist_to_near_bull    (close − near_bull_top) / close; neg = in/below zone
+    fvg_dist_to_near_bear    (near_bear_bot − close) / close; neg = in/above zone
+    fvg_dist_to_target_bull  normalized distance to active bull target (NaN if inactive)
+    fvg_dist_to_target_bear  normalized distance to active bear target
+
+    fvg_bull_inv_with_target 1 if inversion fired AND a next target FVG exists
+    fvg_bear_inv_with_target 1 if inversion fired AND a next target FVG exists
+    """
+    high  = df["High"].values
+    low   = df["Low"].values
+    close = df["Close"].values
+    n     = len(df)
+
+    # ── Pre-allocate output arrays ────────────────────────────────────────────
+    bull_stack_count    = np.zeros(n)
+    bear_stack_count    = np.zeros(n)
+    bull_near_top       = np.full(n, np.nan)
+    bull_near_bot       = np.full(n, np.nan)
+    bull_near_size      = np.full(n, np.nan)
+    bull_near_mid       = np.full(n, np.nan)
+    bear_near_top       = np.full(n, np.nan)
+    bear_near_bot       = np.full(n, np.nan)
+    bear_near_size      = np.full(n, np.nan)
+    bear_near_mid       = np.full(n, np.nan)
+    bull_next_top       = np.full(n, np.nan)
+    bull_next_bot       = np.full(n, np.nan)
+    bear_next_top       = np.full(n, np.nan)
+    bear_next_bot       = np.full(n, np.nan)
+    bull_tgt_top_arr    = np.full(n, np.nan)
+    bull_tgt_bot_arr    = np.full(n, np.nan)
+    bear_tgt_top_arr    = np.full(n, np.nan)
+    bear_tgt_bot_arr    = np.full(n, np.nan)
+    bull_inversion      = np.zeros(n)
+    bear_inversion      = np.zeros(n)
+    bull_stacking       = np.zeros(n)
+    bear_stacking       = np.zeros(n)
+    bull_targeting      = np.zeros(n)
+    bear_targeting      = np.zeros(n)
+    bull_at_next        = np.zeros(n)
+    bear_at_next        = np.zeros(n)
+    dist_near_bull      = np.full(n, np.nan)
+    dist_near_bear      = np.full(n, np.nan)
+    dist_tgt_bull       = np.full(n, np.nan)
+    dist_tgt_bear       = np.full(n, np.nan)
+    bull_inv_with_tgt   = np.zeros(n)
+    bear_inv_with_tgt   = np.zeros(n)
+
+    # ── Impulse strength: rolling FVG creation rate ───────────────────────────
+    bull_created = np.zeros(n)
+    bear_created = np.zeros(n)
+    for i in range(2, n):
+        if low[i]  > high[i - 2]: bull_created[i] = 1.0
+        if high[i] < low[i - 2]:  bear_created[i] = 1.0
+    impulse_up = pd.Series(bull_created).rolling(stack_lookback, min_periods=1).sum().values
+    impulse_dn = pd.Series(bear_created).rolling(stack_lookback, min_periods=1).sum().values
+
+    # ── Active FVG stacks ─────────────────────────────────────────────────────
+    # Each entry: dict {top, bot, touched (bool), created (int)}
+    active_bull: list = []   # sorted DESCENDING by bot (highest demand zone first)
+    active_bear: list = []   # sorted ASCENDING  by bot (lowest supply zone first)
+
+    # Targeting state
+    bull_tgt_on  = False;  bull_tgt_top = bull_tgt_bot = np.nan;  bull_tgt_at = -9999
+    bear_tgt_on  = False;  bear_tgt_top = bear_tgt_bot = np.nan;  bear_tgt_at = -9999
+
+    for i in range(n):
+        c = close[i];  h = high[i];  l = low[i]
+
+        # ── 1. Create new FVGs ─────────────────────────────────────────────
+        if i >= 2:
+            if l > high[i - 2]:                          # bullish gap (up-impulse)
+                active_bull.append({"top": l, "bot": high[i - 2],
+                                    "touched": False, "created": i})
+            if h < low[i - 2]:                           # bearish gap (down-impulse)
+                active_bear.append({"top": low[i - 2], "bot": h,
+                                    "touched": False, "created": i})
+
+        # ── 2. Expire stale FVGs ───────────────────────────────────────────
+        active_bull = [f for f in active_bull if (i - f["created"]) <= stack_lookback]
+        active_bear = [f for f in active_bear if (i - f["created"]) <= stack_lookback]
+
+        # ── 3. Sort stacks by price proximity ─────────────────────────────
+        active_bull.sort(key=lambda x: x["bot"], reverse=True)  # highest first
+        active_bear.sort(key=lambda x: x["bot"])                 # lowest first
+
+        # ── 4. Mark zones as touched (wick entry, bars after creation) ────
+        # Exclude creation bar to prevent same-bar self-touch: a bull FVG's
+        # top == low[creation_bar], so l <= top would trivially fire.
+        for f in active_bull:
+            if i > f["created"] and l <= f["top"]:
+                f["touched"] = True
+        for f in active_bear:
+            if i > f["created"] and h >= f["bot"]:
+                f["touched"] = True
+
+        # ── 5. Detect inversions (BEFORE pruning) ─────────────────────────
+        # Bull inversion: a touched demand zone broken by close below its bottom
+        if any(f["touched"] and c < f["bot"] for f in active_bull):
+            bull_inversion[i] = 1.0
+            # Next target = highest demand zone still intact (bot <= c)
+            survivors = [g for g in active_bull if c >= g["bot"]]
+            if survivors:
+                bull_tgt_on  = True
+                bull_tgt_top = survivors[0]["top"]   # sorted desc → highest survivor
+                bull_tgt_bot = survivors[0]["bot"]
+                bull_tgt_at  = i
+                bull_inv_with_tgt[i] = 1.0
+            else:
+                bull_tgt_on = False                  # inversion with no next FVG
+
+        # Bear inversion: a touched supply zone broken by close above its top
+        if any(f["touched"] and c > f["top"] for f in active_bear):
+            bear_inversion[i] = 1.0
+            # Next target = lowest supply zone still intact (top >= c)
+            survivors = [g for g in active_bear if c <= g["top"]]
+            if survivors:
+                bear_tgt_on  = True
+                bear_tgt_top = survivors[0]["top"]   # sorted asc → lowest survivor
+                bear_tgt_bot = survivors[0]["bot"]
+                bear_tgt_at  = i
+                bear_inv_with_tgt[i] = 1.0
+            else:
+                bear_tgt_on = False
+
+        # ── 6. Prune broken FVGs ──────────────────────────────────────────
+        active_bull = [f for f in active_bull if c >= f["bot"]]
+        active_bear = [f for f in active_bear if c <= f["top"]]
+
+        # ── 7. Record current stack state ─────────────────────────────────
+        bull_stack_count[i] = len(active_bull)
+        bear_stack_count[i] = len(active_bear)
+        bull_stacking[i]    = float(len(active_bull) >= 2)
+        bear_stacking[i]    = float(len(active_bear) >= 2)
+
+        if active_bull:
+            nb = active_bull[0]
+            bull_near_top[i]  = nb["top"]
+            bull_near_bot[i]  = nb["bot"]
+            bull_near_size[i] = nb["top"] - nb["bot"]
+            bull_near_mid[i]  = (nb["top"] + nb["bot"]) / 2
+            dist_near_bull[i] = (c - nb["top"]) / c if c else np.nan
+            if len(active_bull) >= 2:
+                bull_next_top[i] = active_bull[1]["top"]
+                bull_next_bot[i] = active_bull[1]["bot"]
+
+        if active_bear:
+            nb = active_bear[0]
+            bear_near_top[i]  = nb["top"]
+            bear_near_bot[i]  = nb["bot"]
+            bear_near_size[i] = nb["top"] - nb["bot"]
+            bear_near_mid[i]  = (nb["top"] + nb["bot"]) / 2
+            dist_near_bear[i] = (nb["bot"] - c) / c if c else np.nan
+            if len(active_bear) >= 2:
+                bear_next_top[i] = active_bear[1]["top"]
+                bear_next_bot[i] = active_bear[1]["bot"]
+
+        # ── 8. Targeting state machine ────────────────────────────────────
+        # Auto-expire if target not reached within window
+        if bull_tgt_on and (i - bull_tgt_at) > target_expire_bars: bull_tgt_on = False
+        if bear_tgt_on and (i - bear_tgt_at) > target_expire_bars: bear_tgt_on = False
+
+        # Fire targeting signals — one-bar lag after inversion (bull_tgt_at < i)
+        # so the signal is strictly forward-looking.
+        if bull_tgt_on and bull_tgt_at < i:
+            bull_targeting[i]  = 1.0
+            bull_tgt_top_arr[i]= bull_tgt_top
+            bull_tgt_bot_arr[i]= bull_tgt_bot
+            dist_tgt_bull[i]   = (c - bull_tgt_top) / c if c else np.nan
+            # Arrival: wick entered the zone and close held inside it
+            if l <= bull_tgt_top and c >= bull_tgt_bot:
+                bull_at_next[i] = 1.0
+                bull_tgt_on     = False          # target reached — reset
+
+        if bear_tgt_on and bear_tgt_at < i:
+            bear_targeting[i]  = 1.0
+            bear_tgt_top_arr[i]= bear_tgt_top
+            bear_tgt_bot_arr[i]= bear_tgt_bot
+            dist_tgt_bear[i]   = (bear_tgt_bot - c) / c if c else np.nan
+            # Arrival: wick entered the zone and close held inside it
+            if h >= bear_tgt_bot and c <= bear_tgt_top:
+                bear_at_next[i] = 1.0
+                bear_tgt_on     = False
+
+    # ── Assign to DataFrame ───────────────────────────────────────────────────
+    df["fvg_bull_stack_count"]    = bull_stack_count.astype("float32")
+    df["fvg_bear_stack_count"]    = bear_stack_count.astype("float32")
+    df["fvg_impulse_up_count"]    = impulse_up.astype("float32")
+    df["fvg_impulse_dn_count"]    = impulse_dn.astype("float32")
+    df["fvg_near_bull_top"]       = bull_near_top.astype("float32")
+    df["fvg_near_bull_bot"]       = bull_near_bot.astype("float32")
+    df["fvg_near_bull_size"]      = bull_near_size.astype("float32")
+    df["fvg_near_bull_mid"]       = bull_near_mid.astype("float32")
+    df["fvg_near_bear_top"]       = bear_near_top.astype("float32")
+    df["fvg_near_bear_bot"]       = bear_near_bot.astype("float32")
+    df["fvg_near_bear_size"]      = bear_near_size.astype("float32")
+    df["fvg_near_bear_mid"]       = bear_near_mid.astype("float32")
+    df["fvg_next_bull_top"]       = bull_next_top.astype("float32")
+    df["fvg_next_bull_bot"]       = bull_next_bot.astype("float32")
+    df["fvg_next_bear_top"]       = bear_next_top.astype("float32")
+    df["fvg_next_bear_bot"]       = bear_next_bot.astype("float32")
+    df["fvg_target_bull_top"]     = bull_tgt_top_arr.astype("float32")
+    df["fvg_target_bull_bot"]     = bull_tgt_bot_arr.astype("float32")
+    df["fvg_target_bear_top"]     = bear_tgt_top_arr.astype("float32")
+    df["fvg_target_bear_bot"]     = bear_tgt_bot_arr.astype("float32")
+    df["fvg_bull_inversion"]      = bull_inversion.astype("float32")
+    df["fvg_bear_inversion"]      = bear_inversion.astype("float32")
+    df["fvg_bull_stacking"]       = bull_stacking.astype("float32")
+    df["fvg_bear_stacking"]       = bear_stacking.astype("float32")
+    df["fvg_targeting_next_bull"] = bull_targeting.astype("float32")
+    df["fvg_targeting_next_bear"] = bear_targeting.astype("float32")
+    df["fvg_at_next_bull"]        = bull_at_next.astype("float32")
+    df["fvg_at_next_bear"]        = bear_at_next.astype("float32")
+    df["fvg_dist_to_near_bull"]   = dist_near_bull.astype("float32")
+    df["fvg_dist_to_near_bear"]   = dist_near_bear.astype("float32")
+    df["fvg_dist_to_target_bull"] = dist_tgt_bull.astype("float32")
+    df["fvg_dist_to_target_bear"] = dist_tgt_bear.astype("float32")
+    df["fvg_bull_inv_with_target"]= bull_inv_with_tgt.astype("float32")
+    df["fvg_bear_inv_with_target"]= bear_inv_with_tgt.astype("float32")
+
+    return df
+
 
 def _add_index_divergence(df, period="30d", interval="5m", min_ret_threshold=0.0005):
     """
@@ -526,6 +834,7 @@ def build_features(df: pd.DataFrame, period: str = "30d", interval: str = "5m") 
     df = _add_mean_reversion(df)
     df = _add_momentum(df)
     df = _add_sweep_fvg_setups(df)
+    df = _add_fvg_stack_features(df)
     df = _add_index_divergence(df, period=period, interval=interval)
 
     # Safety net: force every boolean-signal column to float32
@@ -656,6 +965,49 @@ FEATURES = [
     "setup_bear_sweep_fvg",
     "setup_bull_confirmed",   # sweep+FVG setup confirmed by green candle
     "setup_bear_confirmed",
+
+    # ── FVG Stack + Sequential Inversion Targeting  (_add_fvg_stack_features) ─
+    "fvg_bull_stack_count",      # # active bull FVGs still in stack
+    "fvg_bear_stack_count",      # # active bear FVGs still in stack
+    "fvg_impulse_up_count",      # bull FVGs created in last stack_lookback bars (impulse strength)
+    "fvg_impulse_dn_count",      # bear FVGs created in last stack_lookback bars
+
+    "fvg_near_bull_top",         # price: top of nearest (highest) active bull FVG
+    "fvg_near_bull_bot",         # price: bottom of nearest active bull FVG
+    "fvg_near_bull_size",        # gap width of nearest bull FVG
+    "fvg_near_bull_mid",         # midpoint of nearest bull FVG
+    "fvg_near_bear_top",         # price: top of nearest (lowest) active bear FVG
+    "fvg_near_bear_bot",         # price: bottom of nearest active bear FVG
+    "fvg_near_bear_size",        # gap width of nearest bear FVG
+    "fvg_near_bear_mid",         # midpoint of nearest bear FVG
+
+    "fvg_next_bull_top",         # price: 2nd bull FVG in the stack (below nearest)
+    "fvg_next_bull_bot",
+    "fvg_next_bear_top",         # price: 2nd bear FVG in the stack (above nearest)
+    "fvg_next_bear_bot",
+
+    "fvg_target_bull_top",       # price: top of the pinned bull target FVG (NaN if inactive)
+    "fvg_target_bull_bot",
+    "fvg_target_bear_top",       # price: top of the pinned bear target FVG
+    "fvg_target_bear_bot",
+
+    "fvg_bull_inversion",        # 1 when nearest bull FVG inversed (close < bot)
+    "fvg_bear_inversion",        # 1 when nearest bear FVG inversed (close > top)
+    "fvg_bull_stacking",         # 1 if ≥2 active bull FVGs (impulse regime detected)
+    "fvg_bear_stacking",         # 1 if ≥2 active bear FVGs
+
+    "fvg_targeting_next_bull",   # 1 while in post-inversion targeting state (bull)
+    "fvg_targeting_next_bear",   # 1 while in post-inversion targeting state (bear)
+    "fvg_at_next_bull",          # 1 when price first arrives at the next bull FVG target
+    "fvg_at_next_bear",          # 1 when price first arrives at the next bear FVG target
+
+    "fvg_dist_to_near_bull",     # (close − near_top) / close; neg = price inside or below zone
+    "fvg_dist_to_near_bear",     # (near_bot − close) / close; neg = price inside or above zone
+    "fvg_dist_to_target_bull",   # normalized distance to active bull target (NaN if inactive)
+    "fvg_dist_to_target_bear",   # normalized distance to active bear target
+
+    "fvg_bull_inv_with_target",  # inversion fired AND next-target FVG exists — the core setup
+    "fvg_bear_inv_with_target",
 
     # ── SPY / QQQ index divergence  (_add_index_divergence) ───────────────
     "spy_ret",                # SPY bar-over-bar return
