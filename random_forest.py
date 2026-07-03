@@ -119,10 +119,10 @@ HOLD_KEEP_FRACTION = 0.2
 # If any single tree in the forest predicts BUY or SELL with leaf purity >=
 # this threshold, the bar is signalled as BUY/SELL regardless of what the
 # majority of trees voted.
-TREE_CERTAINTY_THRESHOLD = 0.30
+TREE_CERTAINTY_THRESHOLD = 0.70
 
 # Standard confidence threshold (used alongside any-tree-fires for comparison)
-CONFIDENCE_THRESHOLD = 0.55
+CONFIDENCE_THRESHOLD = 0.35
 
 # Target codes (must match build_labeled_dataset.py)
 BUY  = 2
@@ -528,78 +528,76 @@ def undersample_hold(X_train, y_train, keep_fraction=HOLD_KEEP_FRACTION):
 # ANY-TREE-FIRES PREDICTION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def predict_any_tree_fires(rf, X, certainty=TREE_CERTAINTY_THRESHOLD):
-    """
-    Signal BUY or SELL if ANY single tree in the forest predicts that class
-    with leaf purity >= certainty.  Bars where no tree fires with sufficient
-    certainty are labelled HOLD.
-
-    Why this is different from standard majority-vote
-    -------------------------------------------------
-    Standard RF predict() requires a majority of all trees to agree before
-    committing to BUY or SELL.  In a 1000-tree forest that means 500+ trees
-    must vote BUY — a very high bar that causes most uncertain bars to be
-    absorbed into HOLD.
-
-    Any-tree-fires instead asks: "does even ONE tree see this bar as a clear
-    BUY or SELL setup?"  Each decision tree partitions the feature space into
-    pure leaf regions.  A leaf with 90%+ BUY purity means the combination of
-    feature values that landed in that leaf is strongly associated with upward
-    price moves in the training data.  Even if 900 other trees are unsure, that
-    one tree has identified a recognisable pattern.
-
-    For a trading system this is a useful signal: a clear ICT setup may only
-    be perfectly formed on a handful of features, which one tree captures
-    completely while others — trained on different random feature subsets —
-    miss it.
-
-    Priority rule: BUY > SELL when both fire on the same bar (can only happen
-    at very low certainty thresholds; rare above 0.65).
-
-    Parameters
-    ----------
-    rf          : fitted RandomForestClassifier (the raw RF, not calibrated)
-    X           : feature matrix to predict on
-    certainty   : minimum leaf purity required for a tree to "fire"
-
-    Returns
-    -------
-    predictions : np.ndarray (int)  — BUY / HOLD / SELL per bar
-    buy_votes   : np.ndarray (int)  — number of trees that fired BUY
-    sell_votes  : np.ndarray (int)  — number of trees that fired SELL
-    """
+def predict_any_tree_fires(rf, X, certainty=TREE_CERTAINTY_THRESHOLD, min_votes=10):
     X_arr = X.values if hasattr(X, "values") else np.asarray(X)
-    n     = len(X_arr)
-
-    classes  = rf.classes_
+    n = len(X_arr)
+    classes = rf.classes_
     buy_idx  = int(np.where(classes == BUY)[0][0])
     sell_idx = int(np.where(classes == SELL)[0][0])
 
     buy_votes  = np.zeros(n, dtype=int)
     sell_votes = np.zeros(n, dtype=int)
-
     for tree in rf.estimators_:
-        leaf_proba  = tree.predict_proba(X_arr)          # (n, n_classes)
+        leaf_proba  = tree.predict_proba(X_arr)
         buy_votes  += (leaf_proba[:, buy_idx]  >= certainty).astype(int)
         sell_votes += (leaf_proba[:, sell_idx] >= certainty).astype(int)
 
     predictions = np.full(n, HOLD, dtype=int)
-    predictions[sell_votes > 0] = SELL
-    predictions[buy_votes  > 0] = BUY    # BUY overrides SELL on conflict
+    buy_fires  = buy_votes  >= min_votes
+    sell_fires = sell_votes >= min_votes
 
-    n_buy  = (predictions == BUY).sum()
-    n_sell = (predictions == SELL).sum()
-    n_hold = (predictions == HOLD).sum()
-
-    print(f"\n── Any-tree-fires prediction (certainty={certainty}) ────")
-    print(f"   BUY  signals : {n_buy:,}  "
-          f"(max trees firing on one bar: {buy_votes.max()})")
-    print(f"   SELL signals : {n_sell:,}  "
-          f"(max trees firing on one bar: {sell_votes.max()})")
-    print(f"   HOLD         : {n_hold:,}")
-    print(f"   Signal coverage : {100*(n_buy+n_sell)/n:.1f} %")
-
+    # only fire when one side clears the bar and actually outnumbers the other
+    predictions[sell_fires & (sell_votes > buy_votes)] = SELL
+    predictions[buy_fires  & (buy_votes  > sell_votes)] = BUY
     return predictions, buy_votes, sell_votes
+
+def diagnose_vote_distribution(rf, X, y_true, certainty_grid=(0.3, 0.4, 0.5, 0.6, 0.7, 0.8)):
+    """
+    For a range of certainty thresholds, print the resulting buy_votes/sell_votes
+    distribution and what precision/coverage you'd get at various min_votes cutoffs.
+    Run this once to pick good values for TREE_CERTAINTY_THRESHOLD and MIN_VOTES.
+    """
+    X_arr = X.values if hasattr(X, "values") else np.asarray(X)
+    y_arr = y_true.values if hasattr(y_true, "values") else np.asarray(y_true)
+    n = len(X_arr)
+    classes = rf.classes_
+    buy_idx  = int(np.where(classes == BUY)[0][0])
+    sell_idx = int(np.where(classes == SELL)[0][0])
+
+    # Get per-tree leaf probabilities once, reuse across certainty levels
+    all_buy_proba  = np.zeros((len(rf.estimators_), n))
+    all_sell_proba = np.zeros((len(rf.estimators_), n))
+    for i, tree in enumerate(rf.estimators_):
+        leaf_proba = tree.predict_proba(X_arr)
+        all_buy_proba[i]  = leaf_proba[:, buy_idx]
+        all_sell_proba[i] = leaf_proba[:, sell_idx]
+
+    for cert in certainty_grid:
+        buy_votes  = (all_buy_proba  >= cert).sum(axis=0)
+        sell_votes = (all_sell_proba >= cert).sum(axis=0)
+
+        print(f"\n═══ certainty = {cert} ═══")
+        print(f"  buy_votes  — mean {buy_votes.mean():.1f}, "
+              f"p50 {np.percentile(buy_votes,50):.0f}, "
+              f"p90 {np.percentile(buy_votes,90):.0f}, "
+              f"p99 {np.percentile(buy_votes,99):.0f}, max {buy_votes.max()}")
+        print(f"  sell_votes — mean {sell_votes.mean():.1f}, "
+              f"p50 {np.percentile(sell_votes,50):.0f}, "
+              f"p90 {np.percentile(sell_votes,90):.0f}, "
+              f"p99 {np.percentile(sell_votes,99):.0f}, max {sell_votes.max()}")
+
+        # Sweep min_votes and report coverage + precision at each
+        print(f"  {'min_votes':>10} {'buy_n':>6} {'buy_prec':>9} {'sell_n':>7} {'sell_prec':>10} {'coverage':>9}")
+        for mv in (1, 5, 10, 20, 30, 50, 75, 100, 150, 200):
+            buy_fire  = (buy_votes  >= mv) & (buy_votes  > sell_votes)
+            sell_fire = (sell_votes >= mv) & (sell_votes > buy_votes)
+
+            buy_n, sell_n = buy_fire.sum(), sell_fire.sum()
+            buy_prec  = (y_arr[buy_fire]  == BUY ).mean() if buy_n  else float("nan")
+            sell_prec = (y_arr[sell_fire] == SELL).mean() if sell_n else float("nan")
+            coverage  = 100 * (buy_n + sell_n) / n
+
+            print(f"  {mv:>10} {buy_n:>6} {buy_prec:>9.3f} {sell_n:>7} {sell_prec:>10.3f} {coverage:>8.1f}%")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -645,6 +643,8 @@ def build_model(ticker=TICKER, period=PERIOD, interval=INTERVAL):
     best_model, X_train, X_cal, X_test, kept_cols = prune_low_importance(
         best_model, X_train, X_cal, X_test, y_train, best_params
     )
+
+    diagnose_vote_distribution(best_model, X_test, y_test)
 
     # ── 7. Probability calibration ────────────────────────────────────────────
     cal_model = calibrate(best_model, X_cal, y_cal)
