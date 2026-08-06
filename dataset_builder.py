@@ -1,5 +1,5 @@
 """
-build_labeled_dataset.py
+dataset_builder.py
 ========================
 Downloads OHLCV data, runs the full feature engineering pipeline, optionally
 adds FinBERT news sentiment features, then labels each bar BUY / SELL / HOLD
@@ -37,7 +37,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from feature_engineering import build_features
+from feature_engineering import build_features, FEATURES
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -82,9 +82,16 @@ LABEL_NAMES = {BUY: "BUY", HOLD: "HOLD", SELL: "SELL"}
 # ─────────────────────────────────────────────────────────────────────────────
 # FEATURE CATALOGUE
 # ─────────────────────────────────────────────────────────────────────────────
-# Every column produced by the full pipeline is listed here, grouped by
-# the function / step that generates it.  This acts as both documentation
-# and the column-selection spec for the output CSV.
+# The technical feature catalogue is NOT duplicated here — it's imported
+# directly from feature_engineering.FEATURES, which is the single source of
+# truth for "what columns does the technical pipeline produce, and which of
+# them do we want in the output." Whatever is active (uncommented) in that
+# list there is exactly what shows up here — nothing to keep in sync by hand.
+#
+# News sentiment columns are a separate concern: feature_engineering.py has
+# no knowledge of them (they're computed here, in _add_sentiment(), not in
+# build_features()), so they're tracked independently and combined with
+# FEATURES below to form the full catalogue.
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Columns that only exist when USE_NEWS_SENTIMENT = True.
@@ -108,221 +115,30 @@ _FVG_ZONE_COLS = [
     "fvg_bear_bot",
 ]
 
-ALL_FEATURE_COLS = [
+# Full catalogue = whatever feature_engineering.py currently produces/selects
+# (FEATURES) + the news columns this file adds on its own — but only when
+# USE_NEWS_SENTIMENT is actually on. Previously _NEWS_COLS was appended
+# unconditionally, which meant news booleans (news_bull, news_bear, etc.)
+# leaked into the training set even when FEATURES had nothing but a few
+# technical columns uncommented — silently defeating the point of using
+# FEATURES to control what the model trains on.
+ALL_FEATURE_COLS = FEATURES + (_NEWS_COLS if USE_NEWS_SENTIMENT else [])
 
-    # ── continuous price ───────────────────────────────────────────────────
-    "Close",
 
-    # ── liquidity sweeps  (_add_liquidity_sweeps) ──────────────────────────
-    "prev_day_high",       # previous session high (price level)
-    "prev_day_low",        # previous session low  (price level)
-    "high_wick_sweep",     # wick pierced prev high but closed below it
-    "low_wick_sweep",      # wick pierced prev low  but closed above it
+def _is_binary_col(series: pd.Series) -> bool:
+    """
+    True if every non-null value in `series` is 0 or 1 (i.e. a boolean-style
+    signal column rather than a continuous indicator).
 
-    # ── candle direction  (_add_candle_features) ───────────────────────────
-    "isGreen",             # close > open
-    "isHigh",              # green candle AND higher close than prior bar
-    "isLow",               # red candle AND lower close than prior bar
-
-    # ── structural trend  (_add_structural_trend) ──────────────────────────
-    # drop_first=True drops "trend_downtrend" (alphabetically first).
-    # Encoding: downtrend → (trend_ranging=0, trend_uptrend=0)
-    "trend_ranging",
-    "trend_uptrend",
-
-    # ── ADX trend strength  (_add_adx) ────────────────────────────────────
-    "ADX",
-    "DMP",                    # +DI
-    "DMN",                    # -DI
-    "is_trending",            # ADX > 25
-    "adx_uptrend",            # ADX > 25 AND +DI > -DI
-    "adx_downtrend",          # ADX > 25 AND -DI > +DI
-    "DI_cross_up",            # +DI just crossed above -DI this bar
-    "DI_cross_down",          # -DI just crossed above +DI this bar
-    "ADX_slope",              # 3-bar change in ADX
-    "trend_strengthening",    # ADX slope > 0
-    "trend_weakening",        # ADX slope < 0
-    "strong_up",              # adx_uptrend AND strengthening
-    "fading_up",              # adx_uptrend AND weakening
-    "strong_down",            # adx_downtrend AND strengthening
-    "fading_down",            # adx_downtrend AND weakening
-
-    # ── MACD + Linear Regression Channel  (_add_macd_lr) ──────────────────
-    "macd_line",
-    "macd_signal",
-    "macd_hist",
-    "lr_upper",               # LR midline + 4σ
-    "lr_lower",               # LR midline − 4σ
-    "near_upper_band",        # close ≥ midline + 0.8×dev (strong bullish)
-    "near_lower_band",        # close ≤ midline − 0.8×dev (strong bearish)
-    "touches_upper",          # close ≥ upper band (stretched)
-    "touches_lower",          # close ≤ lower band (compressed)
-    "broke_above",            # just crossed above upper band
-    "broke_below",            # just crossed below lower band
-    "bands_widening",         # band width > width 3 bars ago
-    "bands_narrowing",        # band width < width 3 bars ago
-    "macd_bullish_entry",     # MACD cross up while near lower band
-    "macd_bearish_entry",     # MACD cross down while near upper band
-    "rsi",
-    "rsi_overbought",         # RSI > 70
-    "rsi_oversold",           # RSI < 30
-
-    # ── mean reversion  (_add_mean_reversion) ─────────────────────────────
-    "mr_below_sma20",
-    "mr_above_sma20",
-    "mr_bb_below_lower",      # below lower Bollinger Band (2σ)
-    "mr_bb_above_upper",      # above upper Bollinger Band (2σ)
-    "mr_rsi_oversold",
-    "mr_rsi_overbought",
-    "mr_z_score_low",         # Z-score < −1.5
-    "mr_z_score_high",        # Z-score >  1.5
-    "mr_below_vwap",
-    "mr_above_vwap",
-
-    # ── momentum  (_add_momentum) ──────────────────────────────────────────
-    "mo_roc_positive_20",     # 20-bar rate-of-change > 0
-    "mo_roc_negative_20",
-    "mo_golden_cross",        # SMA50 just crossed above SMA200
-    "mo_death_cross",
-    "mo_macd_cross_up",
-    "mo_macd_cross_down",
-    "mo_adx_trending",        # ADX > 25
-    "mo_breakout_high20",     # close > 20-bar rolling high (no lookahead)
-    "mo_breakdown_low20",
-    "mo_volume_surge",        # volume > 2× 20-bar average
-    "mo_consecutive_up3",     # 3+ consecutive green bars
-    "mo_consecutive_down3",
-    "mo_combo_long",          # ≥2 of 5 bullish momentum signals firing
-    "mo_combo_short",
-
-    # ── ICT liquidity sweep → FVG setups  (_add_sweep_fvg_setups) ─────────
-    "fvg_bull_top",           # top of active bullish FVG (NaN = no active zone)
-    "fvg_bull_bot",
-    "fvg_bear_top",
-    "fvg_bear_bot",
-    "in_bull_fvg",            # price is currently inside a bullish FVG
-    "in_bear_fvg",
-    "recent_low_sweep",       # low sweep within last sweep_lookback bars
-    "recent_high_sweep",
-    "setup_bull_sweep_fvg",   # recent low sweep + currently in bull FVG
-    "setup_bear_sweep_fvg",
-    "setup_bull_confirmed",   # sweep+FVG setup confirmed by green candle
-    "setup_bear_confirmed",
-
-    # ── SPY / QQQ index divergence  (_add_index_divergence) ───────────────
-    "spy_ret",                # SPY bar-over-bar return
-    "qqq_ret",                # QQQ bar-over-bar return
-    "idx_div_spy_up_qqq_down",
-    "idx_div_spy_down_qqq_up",
-    "idx_div_any",
-    "idx_div_rolling3",       # divergence persisted in any of last 3 bars
-    "idx_corr_20",            # 20-bar rolling SPY/QQQ correlation
-    "idx_corr_breakdown",     # rolling correlation < 0.5 (regime decoupling)
-
-    # ── FinBERT / Finnhub news sentiment  (step 3 — optional) ─────────────
-    # Only present when USE_NEWS_SENTIMENT = True.
-    *_NEWS_COLS,
-]
-
-# Subset of ALL_FEATURE_COLS that are strictly boolean (0/1) signals.
-# Continuous columns (ADX, RSI, MACD values, price levels, raw returns, etc.)
-# are excluded.  "Close" is also excluded here — it is added explicitly
-# alongside these in build_labeled_dataset() as the only continuous input.
-#
-# Used by build_labeled_dataset() so the supervised model sees:
-#     Close  +  all boolean signals below  +  target
-BOOLEAN_FEATURE_COLS = [
-    # ── liquidity sweeps ───────────────────────────────────────────────────
-    "high_wick_sweep",
-    "low_wick_sweep",
-
-    # ── candle direction ───────────────────────────────────────────────────
-    "isGreen",
-    "isHigh",
-    "isLow",
-
-    # ── structural trend ───────────────────────────────────────────────────
-    "trend_ranging",
-    "trend_uptrend",
-
-    # ── ADX ────────────────────────────────────────────────────────────────
-    "is_trending",
-    "adx_uptrend",
-    "adx_downtrend",
-    "DI_cross_up",
-    "DI_cross_down",
-    "trend_strengthening",
-    "trend_weakening",
-    "strong_up",
-    "fading_up",
-    "strong_down",
-    "fading_down",
-
-    # ── MACD + Linear Regression Channel ──────────────────────────────────
-    "near_upper_band",
-    "near_lower_band",
-    "touches_upper",
-    "touches_lower",
-    "broke_above",
-    "broke_below",
-    "bands_widening",
-    "bands_narrowing",
-    "macd_bullish_entry",
-    "macd_bearish_entry",
-    "rsi_overbought",
-    "rsi_oversold",
-
-    # ── mean reversion ─────────────────────────────────────────────────────
-    "mr_below_sma20",
-    "mr_above_sma20",
-    "mr_bb_below_lower",
-    "mr_bb_above_upper",
-    "mr_rsi_oversold",
-    "mr_rsi_overbought",
-    "mr_z_score_low",
-    "mr_z_score_high",
-    "mr_below_vwap",
-    "mr_above_vwap",
-
-    # ── momentum ───────────────────────────────────────────────────────────
-    "mo_roc_positive_20",
-    "mo_roc_negative_20",
-    "mo_golden_cross",
-    "mo_death_cross",
-    "mo_macd_cross_up",
-    "mo_macd_cross_down",
-    "mo_adx_trending",
-    "mo_breakout_high20",
-    "mo_breakdown_low20",
-    "mo_volume_surge",
-    "mo_consecutive_up3",
-    "mo_consecutive_down3",
-    "mo_combo_long",
-    "mo_combo_short",
-
-    # ── ICT sweep → FVG setups ─────────────────────────────────────────────
-    "in_bull_fvg",
-    "in_bear_fvg",
-    "recent_low_sweep",
-    "recent_high_sweep",
-    "setup_bull_sweep_fvg",
-    "setup_bear_sweep_fvg",
-    "setup_bull_confirmed",
-    "setup_bear_confirmed",
-
-    # ── SPY / QQQ index divergence ─────────────────────────────────────────
-    "idx_div_spy_up_qqq_down",
-    "idx_div_spy_down_qqq_up",
-    "idx_div_any",
-    "idx_div_rolling3",
-    "idx_corr_breakdown",
-
-    # ── news sentiment (optional) ──────────────────────────────────────────
-    "news_bull",
-    "news_bear",
-    "news_sentiment_strong_bull",
-    "news_sentiment_strong_bear",
-]
+    This replaces a hand-maintained "which columns are boolean" list: instead
+    of keeping a second catalogue that has to be updated every time
+    feature_engineering.py adds/removes a column, the boolean subset of
+    FEATURES is detected directly from the data. Add a new signal column to
+    feature_engineering.FEATURES and it's automatically picked up here with
+    zero changes needed in this file.
+    """
+    vals = pd.to_numeric(series, errors="coerce").dropna().unique()
+    return set(np.unique(vals)).issubset({0.0, 1.0})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -518,7 +334,7 @@ def _build_enriched(
     step(2, total, "Building technical features …")
     print("      (Note: _add_structural_trend has an O(n·lookback) Python loop;")
     print("       expect ~20–40 s for 60 days of 5-min data.)")
-    enriched = build_features(raw, period=period, interval=interval)
+    enriched = build_features(raw, period=period, interval=interval, ticker=ticker)
     print(f"      Done — {enriched.shape[1]} columns after technical features.")
 
     # ── [3] News sentiment ────────────────────────────────────────────────────
@@ -583,9 +399,11 @@ def build_labeled_dataset(
 
     Columns kept
     ------------
-    Close                — the only continuous feature; price context for the model
-    BOOLEAN_FEATURE_COLS — all 0/1 signal features (see catalogue above)
-    target               — int  2=BUY  1=HOLD  0=SELL
+    Close        — the only continuous feature; price context for the model
+    bool_cols    — every column from feature_engineering.FEATURES (+ news
+                   cols) whose values are all 0/1 in the actual data (see
+                   _is_binary_col) — detected live, not hand-listed
+    target       — int  2=BUY  1=HOLD  0=SELL
 
     Continuous indicators (ADX, RSI, MACD values, price levels, raw returns)
     are intentionally excluded so the model learns from discrete signals only.
@@ -616,7 +434,7 @@ def build_labeled_dataset(
     # _build_enriched generates ALL features; we narrow down to Close + booleans
     # in step [5] below rather than restricting what gets computed, so that
     # label_signals() still has access to Close, High, Low for thresholds.
-    enriched, _ = _build_enriched(ticker, period, interval)
+    enriched, feat_cols = _build_enriched(ticker, period, interval)
 
     # ── [4] Label ─────────────────────────────────────────────────────────────
     print(
@@ -629,12 +447,13 @@ def build_labeled_dataset(
     # ── [5] Finalise ──────────────────────────────────────────────────────────
     print("[5/5] Selecting Close + boolean features, cleaning and finalising …")
 
-    # Build the column list: Close first, then every boolean col that exists,
-    # then target.  Columns absent from enriched (e.g. news cols when sentiment
-    # is off) are silently skipped via the list comprehension guard.
-    bool_cols = [c for c in BOOLEAN_FEATURE_COLS if c in enriched.columns]
-    keep      = list(dict.fromkeys(["Close"] + bool_cols + ["target"]))
-    dataset   = enriched[keep].copy()
+    # Candidate columns come entirely from feat_cols, which is derived from
+    # feature_engineering.FEATURES (+ news cols) — no separate hand-kept list.
+    # Among those, keep the ones whose actual values are binary (0/1).
+    candidates = [c for c in feat_cols if c != "Close" and c in enriched.columns]
+    bool_cols  = [c for c in candidates if _is_binary_col(enriched[c])]
+    keep       = list(dict.fromkeys(["Close"] + bool_cols + ["target"]))
+    dataset    = enriched[keep].copy()
 
     # Drop unlabelable tail rows (target NaN for last FORWARD_BARS bars)
     n_before = len(dataset)
@@ -643,8 +462,8 @@ def build_labeled_dataset(
     print(f"  Dropped {n_before - n_after:,} tail rows. {n_after:,} rows remain.")
 
     # NaN handling for boolean feature columns
-    # (FVG zone cols not present here since we excluded fvg_bull_top etc.,
-    #  but _clean_features handles them safely via intersection checks)
+    # (FVG zone cols not present here since those are continuous price levels,
+    #  not boolean, but _clean_features handles them safely via intersection checks)
     dataset = _clean_features(dataset, bool_cols)
 
     # Safe to cast now that all NaN rows are gone
@@ -667,7 +486,7 @@ def build_labeled_dataset(
     elif LABEL_METHOD == "rolling_std": print(f"  ({STD_MULT}× 20-bar σ)")
     print(f"  Forward bars    : {FORWARD_BARS} (≈ {FORWARD_BARS * bar_num} {bar_unit})")
     print(f"  Continuous cols : 1  (Close)")
-    print(f"  Boolean cols    : {len(bool_cols)}")
+    print(f"  Boolean cols    : {len(bool_cols)}  (auto-detected from FEATURES)")
     print(f"  News sentiment  : {'✓ included' if news_bool_present else '✗ skipped'}")
     print(f"  Total rows      : {total:,}")
     print(f"\n  Class distribution:")
@@ -711,7 +530,8 @@ def build_unlabeled_dataset(
     Returns
     -------
     pd.DataFrame with columns:
-        <all feature columns>  — from ALL_FEATURE_COLS, whichever exist
+        <all feature columns>  — from feature_engineering.FEATURES + news
+        cols, whichever exist
         (no target, no raw OHLCV reference columns)
 
     The datetime index is preserved so clusters or anomaly scores can be
@@ -778,9 +598,9 @@ def filter_dataset(
     dataset      : pd.DataFrame
         Output of build_labeled_dataset() or build_unlabeled_dataset().
     feature_cols : list[str]
-        The columns you want to keep.  Pass any subset of ALL_FEATURE_COLS
-        or BOOLEAN_FEATURE_COLS — the same format as the FEATURES list in
-        feature_engineering.py.
+        The columns you want to keep.  Pass any subset of
+        feature_engineering.FEATURES (+ news cols) — same format as the
+        FEATURES list in feature_engineering.py.
 
     Returns
     -------
@@ -789,16 +609,7 @@ def filter_dataset(
 
     Example
     -------
-        FEATURES = [
-            "Close",
-            "fvg_bull_top", "fvg_bull_bot", "fvg_bear_top", "fvg_bear_bot",
-            "in_bull_fvg",  "in_bear_fvg",
-            "recent_low_sweep", "recent_high_sweep",
-            "setup_bull_sweep_fvg", "setup_bear_sweep_fvg",
-            "setup_bull_confirmed", "setup_bear_confirmed",
-            "news_bull", "news_bear",
-            "news_sentiment_strong_bull", "news_sentiment_strong_bear",
-        ]
+        from feature_engineering import FEATURES
         filtered = filter_dataset(labeled, FEATURES)
     """
     # Separate out which requested columns actually exist
@@ -843,136 +654,12 @@ if __name__ == "__main__":
     unlabeled.to_csv(OUTPUT_PATH_UNLABELED)
     print(f"✓  Saved unlabeled → {OUTPUT_PATH_UNLABELED}")
 
-    # ── Filter example — ICT + news features only ─────────────────────────────
-    # Pass any list of column names to get back a narrowed dataset.
-    # Columns that don't exist (e.g. news cols when sentiment is off) are
-    # skipped with a warning.  target is always preserved automatically.
-    NEWS_COLS = [
-    "news_sentiment_score",       # continuous EW-mean score in [-1, 1]
-    "news_article_count",         # number of articles in the rolling window
-    "news_bull",                  # score > +0.15
-    "news_bear",                  # score < -0.15
-    "news_sentiment_strong_bull", # score > +0.40
-    "news_sentiment_strong_bear", # score < -0.40
-]
-
-
-    FEATURES = [
-
-    # ── continuous price ───────────────────────────────────────────────────
-    "Close",
-
-    # # ── liquidity sweeps  (_add_liquidity_sweeps) ──────────────────────────
-    # "prev_day_high",       # previous session high (price level)
-    # "prev_day_low",        # previous session low  (price level)
-    # "high_wick_sweep",     # wick pierced prev high but closed below it
-    # "low_wick_sweep",      # wick pierced prev low  but closed above it
-
-    # # ── candle direction  (_add_candle_features) ───────────────────────────
-    # "isGreen",             # close > open
-    # "isHigh",              # green candle AND higher close than prior bar
-    # "isLow",               # red candle AND lower close than prior bar
-
-    # # ── structural trend  (_add_structural_trend) ──────────────────────────
-    # # drop_first=True drops "trend_downtrend" (alphabetically first).
-    # # Encoding: downtrend → (trend_ranging=0, trend_uptrend=0)
-    # "trend_ranging",
-    # "trend_uptrend",
-
-    # # ── ADX trend strength  (_add_adx) ────────────────────────────────────
-    # "ADX",
-    # "DMP",                    # +DI
-    # "DMN",                    # -DI
-    # "is_trending",            # ADX > 25
-    # "adx_uptrend",            # ADX > 25 AND +DI > -DI
-    # "adx_downtrend",          # ADX > 25 AND -DI > +DI
-    # "DI_cross_up",            # +DI just crossed above -DI this bar
-    # "DI_cross_down",          # -DI just crossed above +DI this bar
-    # "ADX_slope",              # 3-bar change in ADX
-    # "trend_strengthening",    # ADX slope > 0
-    # "trend_weakening",        # ADX slope < 0
-    # "strong_up",              # adx_uptrend AND strengthening
-    # "fading_up",              # adx_uptrend AND weakening
-    # "strong_down",            # adx_downtrend AND strengthening
-    # "fading_down",            # adx_downtrend AND weakening
-
-    # # ── MACD + Linear Regression Channel  (_add_macd_lr) ──────────────────
-    # "macd_line",
-    # "macd_signal",
-    # "macd_hist",
-    # "lr_upper",               # LR midline + 4σ
-    # "lr_lower",               # LR midline − 4σ
-    # "near_upper_band",        # close ≥ midline + 0.8×dev (strong bullish)
-    # "near_lower_band",        # close ≤ midline − 0.8×dev (strong bearish)
-    # "touches_upper",          # close ≥ upper band (stretched)
-    # "touches_lower",          # close ≤ lower band (compressed)
-    # "broke_above",            # just crossed above upper band
-    # "broke_below",            # just crossed below lower band
-    # "bands_widening",         # band width > width 3 bars ago
-    # "bands_narrowing",        # band width < width 3 bars ago
-    # "macd_bullish_entry",     # MACD cross up while near lower band
-    # "macd_bearish_entry",     # MACD cross down while near upper band
-    # "rsi",
-    # "rsi_overbought",         # RSI > 70
-    # "rsi_oversold",           # RSI < 30
-
-    # # ── mean reversion  (_add_mean_reversion) ─────────────────────────────
-    # "mr_below_sma20",
-    # "mr_above_sma20",
-    # "mr_bb_below_lower",      # below lower Bollinger Band (2σ)
-    # "mr_bb_above_upper",      # above upper Bollinger Band (2σ)
-    # "mr_rsi_oversold",
-    # "mr_rsi_overbought",
-    # "mr_z_score_low",         # Z-score < −1.5
-    # "mr_z_score_high",        # Z-score >  1.5
-    # "mr_below_vwap",
-    # "mr_above_vwap",
-
-    # # ── momentum  (_add_momentum) ──────────────────────────────────────────
-    # "mo_roc_positive_20",     # 20-bar rate-of-change > 0
-    # "mo_roc_negative_20",
-    # "mo_golden_cross",        # SMA50 just crossed above SMA200
-    # "mo_death_cross",
-    # "mo_macd_cross_up",
-    # "mo_macd_cross_down",
-    # "mo_adx_trending",        # ADX > 25
-    # "mo_breakout_high20",     # close > 20-bar rolling high (no lookahead)
-    # "mo_breakdown_low20",
-    # "mo_volume_surge",        # volume > 2× 20-bar average
-    # "mo_consecutive_up3",     # 3+ consecutive green bars
-    # "mo_consecutive_down3",
-    # "mo_combo_long",          # ≥2 of 5 bullish momentum signals firing
-    # "mo_combo_short",
-
-    # ── ICT liquidity sweep → FVG setups  (_add_sweep_fvg_setups) ─────────
-    "fvg_bull_top",           # top of active bullish FVG (NaN = no active zone)
-    "fvg_bull_bot",
-    "fvg_bear_top",
-    "fvg_bear_bot",
-    "in_bull_fvg",            # price is currently inside a bullish FVG
-    "in_bear_fvg",
-    "recent_low_sweep",       # low sweep within last sweep_lookback bars
-    "recent_high_sweep",
-    "setup_bull_sweep_fvg",   # recent low sweep + currently in bull FVG
-    "setup_bear_sweep_fvg",
-    "setup_bull_confirmed",   # sweep+FVG setup confirmed by green candle
-    "setup_bear_confirmed",
-
-    # # ── SPY / QQQ index divergence  (_add_index_divergence) ───────────────
-    # "spy_ret",                # SPY bar-over-bar return
-    # "qqq_ret",                # QQQ bar-over-bar return
-    # "idx_div_spy_up_qqq_down",
-    # "idx_div_spy_down_qqq_up",
-    # "idx_div_any",
-    # "idx_div_rolling3",       # divergence persisted in any of last 3 bars
-    # "idx_corr_20",            # 20-bar rolling SPY/QQQ correlation
-    # "idx_corr_breakdown",     # rolling correlation < 0.5 (regime decoupling)
-
-    # ── FinBERT / Finnhub news sentiment  (step 3 — optional) ─────────────
-    # Only present when USE_NEWS_SENTIMENT = True.
-    # *_NEWS_COLS,
-]
-
+    # ── Filter example — same FEATURES list used everywhere else ─────────────
+    # Pass any list of column names to get back a narrowed dataset. Columns
+    # that don't exist (e.g. news cols when sentiment is off) are skipped
+    # with a warning. target is always preserved automatically.
+    # Uncomment/comment entries directly in feature_engineering.FEATURES to
+    # control what shows up here — there's no separate list to maintain.
     filtered_labeled   = filter_dataset(labeled,   FEATURES)
     filtered_unlabeled = filter_dataset(unlabeled, FEATURES)
 

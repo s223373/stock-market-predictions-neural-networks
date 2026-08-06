@@ -22,8 +22,9 @@ import schedule
 import yfinance as yf
 from sklearn.preprocessing import MinMaxScaler
 
-from features import build_features, FEATURES
+from feature_engineering import build_features, FEATURES
 from lstm_backtest import StockPriceLSTMNetwork
+from model import StockPriceLSTMNetwork
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG

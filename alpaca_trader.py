@@ -39,8 +39,8 @@ from model import StockPriceLSTMNetworkDualStream, prepare_price_input
 # CONFIG  ← edit everything in this block; touch nothing else
 # ─────────────────────────────────────────────────────────────────────────────
 
-API_KEY    = "YOUR_ALPACA_API_KEY"
-SECRET_KEY = "YOUR_ALPACA_SECRET_KEY"
+API_KEY    = "PKN6TP427BA4GIWVDMGRYC66Z3"
+SECRET_KEY = "B6HRex2yNGWN3126YLgR85njCnovdJvSs3ArU3iM3BfB"
 PAPER      = True          # True = paper trading; False = live money
 
 SYMBOL      = "SPY"        # ticker to trade — match TICKER in train.py
@@ -52,7 +52,7 @@ SELL_THRESHOLD = -0.001   # pred - last_close < this  → SELL
 ORDER_QTY      = 1        # shares per order (keep small during testing)
 
 # Path to the checkpoint produced by train.py
-MODEL_PATH = "StockPriceLSTMNetwork_YYYY-MM-DD_HH-MM-SS.pt"  # ← update this
+MODEL_PATH = "StockPriceLSTMNetwork_2026-06-09_13-11-55.pt"  # ← update this
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING

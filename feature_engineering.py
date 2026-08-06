@@ -805,11 +805,233 @@ def _add_index_divergence(df, period="30d", interval="5m", min_ret_threshold=0.0
     return df
 
 
+def _detect_breaker_double_inverse(o, h, l, c, structure_lookback=20):
+    """
+    Single-pass, no-lookahead detector for ICT-style breaker-block
+    "double inversions" on one series of OHLC arrays.
+
+    Order block (OB)
+    -----------------
+    Bullish OB: the last bearish (red, close < open) candle immediately
+    before a bar that closes above the recent rolling swing high — a
+    bullish break of structure / impulse up. Its price range is the
+    candle's real body: [min(open, close), max(open, close)].
+
+    Bearish OB: the last bullish (green) candle immediately before a bar
+    that closes below the recent rolling swing low — bearish break of
+    structure. Same body-range definition.
+
+    Breaker block
+    -------------
+    An OB becomes a "breaker" the first time price closes back through
+    it against its original bias:
+      - a bullish OB is broken (becomes a bearish breaker) when a later
+        close < the OB's bottom.
+      - a bearish OB is broken (becomes a bullish breaker) when a later
+        close > the OB's top.
+
+    Double inverse (what this function flags)
+    -------------------------------------------
+    A "double inverse" fires when a breaker block is itself broken back
+    through in the OB's *original* direction — price reclaims the zone:
+      - a bearish breaker (former bullish OB) double-inverses when a
+        later close > the zone's top → bullish signal.
+      - a bullish breaker (former bearish OB) double-inverses when a
+        later close < the zone's bottom → bearish signal.
+
+    Order/breaker blocks are never expired by age — once created they
+    are remembered indefinitely and only dropped once they've fired
+    their double-inverse signal, so tracking reaches back as far as the
+    data provided allows.
+
+    Returns
+    -------
+    (bull_double_inverse, bear_double_inverse) : two float arrays, same
+    length as the input, 1.0 on the bar where the double-inverse closes,
+    else 0.0.
+    """
+    n = len(c)
+    bull_double_inverse = np.zeros(n)
+    bear_double_inverse = np.zeros(n)
+
+    if n < structure_lookback + 2:
+        return bull_double_inverse, bear_double_inverse
+
+    prior_high = pd.Series(h).shift(1).rolling(structure_lookback, min_periods=1).max().values
+    prior_low  = pd.Series(l).shift(1).rolling(structure_lookback, min_periods=1).min().values
+
+    bull_obs: list = []   # each: {"top", "bot", "created", "state"}; state: "ob" -> "breaker" -> consumed
+    bear_obs: list = []
+
+    for i in range(n):
+        # ---- 1. New order block creation on structure break ----
+        if not np.isnan(prior_high[i]) and c[i] > prior_high[i]:
+            j = i - 1
+            while j >= 0 and c[j] >= o[j]:      # scan back for nearest bearish candle
+                j -= 1
+            if j >= 0:
+                bull_obs.append({
+                    "top": max(o[j], c[j]), "bot": min(o[j], c[j]),
+                    "created": j, "state": "ob",
+                })
+
+        if not np.isnan(prior_low[i]) and c[i] < prior_low[i]:
+            j = i - 1
+            while j >= 0 and c[j] <= o[j]:      # scan back for nearest bullish candle
+                j -= 1
+            if j >= 0:
+                bear_obs.append({
+                    "top": max(o[j], c[j]), "bot": min(o[j], c[j]),
+                    "created": j, "state": "ob",
+                })
+
+        # ---- 2. Advance state machine for existing bullish OBs ----
+        still_bull = []
+        for ob in bull_obs:
+            consumed = False
+            if i > ob["created"]:
+                if ob["state"] == "ob" and c[i] < ob["bot"]:
+                    ob["state"] = "breaker"
+                elif ob["state"] == "breaker" and c[i] > ob["top"]:
+                    bull_double_inverse[i] = 1.0
+                    consumed = True
+            if not consumed:
+                still_bull.append(ob)
+        bull_obs = still_bull
+
+        # ---- 3. Advance state machine for existing bearish OBs ----
+        still_bear = []
+        for ob in bear_obs:
+            consumed = False
+            if i > ob["created"]:
+                if ob["state"] == "ob" and c[i] > ob["top"]:
+                    ob["state"] = "breaker"
+                elif ob["state"] == "breaker" and c[i] < ob["bot"]:
+                    bear_double_inverse[i] = 1.0
+                    consumed = True
+            if not consumed:
+                still_bear.append(ob)
+        bear_obs = still_bear
+
+    return bull_double_inverse, bear_double_inverse
+
+
+def _add_breaker_blocks_single_tf(raw_df, structure_lookback=20):
+    """Run the breaker-block double-inverse detector on one timeframe's OHLC data."""
+    o = raw_df["Open"].astype(float).values
+    h = raw_df["High"].astype(float).values
+    l = raw_df["Low"].astype(float).values
+    c = raw_df["Close"].astype(float).values
+    bull_di, bear_di = _detect_breaker_double_inverse(o, h, l, c, structure_lookback)
+    return pd.DataFrame(
+        {"bull_double_inverse": bull_di, "bear_double_inverse": bear_di},
+        index=raw_df.index,
+    )
+
+
+def _align_signal_to_primary(sig_df, primary_index, tf_minutes):
+    """
+    Align a lower-timeframe signal onto the primary dataframe's index with
+    no lookahead. If the source timeframe is finer than the primary bar
+    spacing, first take a rolling MAX over the number of finer bars that
+    fit inside one primary bar, so a fast intrabar double-inverse isn't
+    missed between two primary bars. Then carry the value forward with a
+    backward (point-in-time) as-of merge.
+    """
+    sig_df = sig_df.copy()
+    sig_df.index.name = "ts"
+
+    primary_freq = pd.Series(primary_index).diff().median()
+    tf_delta = pd.Timedelta(minutes=tf_minutes)
+    if pd.notna(primary_freq) and tf_delta < primary_freq:
+        window_bars = max(1, int(primary_freq / tf_delta))
+        sig_df = sig_df.rolling(window_bars, min_periods=1).max()
+
+    sig_df = sig_df.sort_index()
+    left = pd.DataFrame({"ts": pd.DatetimeIndex(primary_index)}).sort_values("ts")
+    merged = pd.merge_asof(left, sig_df.reset_index(), on="ts", direction="backward")
+    merged = merged.set_index("ts").reindex(pd.DatetimeIndex(primary_index))
+    return merged[["bull_double_inverse", "bear_double_inverse"]].fillna(0.0)
+
+
+def _add_breaker_block_features(df, ticker=None, structure_lookback=20):
+    """
+    Multi-timeframe ICT breaker-block "double inverse" signals.
+
+    See _detect_breaker_double_inverse for the exact order-block /
+    breaker / double-inverse definitions. This wrapper independently
+    downloads 1m, 5m, and 15m history for `ticker`, runs the detector on
+    each timeframe, and aligns the resulting signals onto df's index
+    (point-in-time, no lookahead).
+
+    Order/breaker blocks are tracked with unlimited memory — they are
+    never dropped for being "too old," only once they've fired their
+    double-inverse signal — so detection reaches back as far as the
+    downloaded history on each timeframe allows. Yahoo Finance itself
+    caps how much history it will serve regardless of what's requested:
+      • 1m bars       → roughly the last 7 days only
+      • 5m/15m bars   → roughly the last 60 days only
+    so "as far back as possible" is bounded by those Yahoo limits, not
+    by anything in this function.
+
+    Requires `ticker` (e.g. "AAPL") since these are downloaded
+    independently of whatever interval df itself is already on. If no
+    ticker is supplied, all columns below are filled with 0.0.
+
+    Columns added (tf in {"1m", "5m", "15m"}):
+      breaker_bull_double_inverse_{tf}   # bullish breaker reclaimed upward
+      breaker_bear_double_inverse_{tf}   # bearish breaker reclaimed downward
+    Plus, True if ANY timeframe fired on that bar:
+      breaker_bull_double_inverse_any
+      breaker_bear_double_inverse_any
+    """
+    timeframes = {"1m": ("7d", 1), "5m": ("60d", 5), "15m": ("60d", 15)}
+
+    if ticker is None:
+        print("[breaker_blocks] No ticker supplied — skipping multi-timeframe "
+              "breaker-block features (filled with 0).")
+        for tf in timeframes:
+            df[f"breaker_bull_double_inverse_{tf}"] = 0.0
+            df[f"breaker_bear_double_inverse_{tf}"] = 0.0
+        df["breaker_bull_double_inverse_any"] = 0.0
+        df["breaker_bear_double_inverse_any"] = 0.0
+        return df
+
+    for tf, (max_period, tf_minutes) in timeframes.items():
+        try:
+            raw = yf.download(ticker, period=max_period, interval=tf,
+                               progress=False, auto_adjust=True)
+            if isinstance(raw.columns, pd.MultiIndex):
+                raw.columns = raw.columns.get_level_values(0)
+            raw = raw.dropna(subset=["Open", "High", "Low", "Close"])
+            if raw.empty:
+                raise ValueError("empty download")
+
+            sig = _add_breaker_blocks_single_tf(raw, structure_lookback=structure_lookback)
+            aligned = _align_signal_to_primary(sig, df.index, tf_minutes)
+            bull_col = aligned["bull_double_inverse"]
+            bear_col = aligned["bear_double_inverse"]
+        except Exception as e:
+            print(f"[breaker_blocks] {tf} download/processing failed: {e}. Filling with 0.")
+            bull_col = pd.Series(0.0, index=df.index)
+            bear_col = pd.Series(0.0, index=df.index)
+
+        df[f"breaker_bull_double_inverse_{tf}"] = bull_col.astype("float32").values
+        df[f"breaker_bear_double_inverse_{tf}"] = bear_col.astype("float32").values
+
+    bull_cols = [f"breaker_bull_double_inverse_{tf}" for tf in timeframes]
+    bear_cols = [f"breaker_bear_double_inverse_{tf}" for tf in timeframes]
+    df["breaker_bull_double_inverse_any"] = df[bull_cols].max(axis=1)
+    df["breaker_bear_double_inverse_any"] = df[bear_cols].max(axis=1)
+
+    return df
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_features(df: pd.DataFrame, period: str = "30d", interval: str = "5m") -> pd.DataFrame:
+def build_features(df: pd.DataFrame, period: str = "30d", interval: str = "5m", ticker: str = None) -> pd.DataFrame:
     """
     Run all feature engineering on a raw OHLCV dataframe.
 
@@ -822,6 +1044,10 @@ def build_features(df: pd.DataFrame, period: str = "30d", interval: str = "5m") 
         _add_index_divergence so SPY/QQQ are downloaded over the same window.
     interval : str
         The interval used when downloading df (e.g. "5m").
+    ticker : str, optional
+        Symbol string (e.g. "AAPL") used to independently download 1m/5m/15m
+        history for the multi-timeframe breaker-block features. If omitted,
+        those columns are filled with 0.
 
     Returns the enriched dataframe.
     """
@@ -836,6 +1062,7 @@ def build_features(df: pd.DataFrame, period: str = "30d", interval: str = "5m") 
     df = _add_sweep_fvg_setups(df)
     df = _add_fvg_stack_features(df)
     df = _add_index_divergence(df, period=period, interval=interval)
+    df = _add_breaker_block_features(df, ticker=ticker)
 
     # Safety net: force every boolean-signal column to float32
     bool_signal_cols = [c for c in df.columns if c in FEATURES and c != "Close"]
@@ -870,154 +1097,164 @@ FEATURES = [
     # ── continuous price ───────────────────────────────────────────────────
     "Close",
 
-    # ── liquidity sweeps  (_add_liquidity_sweeps) ──────────────────────────
-    "prev_day_high",       # previous session high (price level)
-    "prev_day_low",        # previous session low  (price level)
-    "high_wick_sweep",     # wick pierced prev high but closed below it
-    "low_wick_sweep",      # wick pierced prev low  but closed above it
+    # # ── liquidity sweeps  (_add_liquidity_sweeps) ──────────────────────────
+    # "prev_day_high",       # previous session high (price level)
+    # "prev_day_low",        # previous session low  (price level)
+    # "high_wick_sweep",     # wick pierced prev high but closed below it
+    # "low_wick_sweep",      # wick pierced prev low  but closed above it
 
-    # ── candle direction  (_add_candle_features) ───────────────────────────
-    "isGreen",             # close > open
-    "isHigh",              # green candle AND higher close than prior bar
-    "isLow",               # red candle AND lower close than prior bar
+    # # ── candle direction  (_add_candle_features) ───────────────────────────
+    # "isGreen",             # close > open
+    # "isHigh",              # green candle AND higher close than prior bar
+    # "isLow",               # red candle AND lower close than prior bar
 
-    # ── structural trend  (_add_structural_trend) ──────────────────────────
-    # drop_first=True drops "trend_downtrend" (alphabetically first).
-    # Encoding: downtrend → (trend_ranging=0, trend_uptrend=0)
-    "trend_ranging",
-    "trend_uptrend",
+    # # ── structural trend  (_add_structural_trend) ──────────────────────────
+    # # drop_first=True drops "trend_downtrend" (alphabetically first).
+    # # Encoding: downtrend → (trend_ranging=0, trend_uptrend=0)
+    # "trend_ranging",
+    # "trend_uptrend",
 
-    # ── ADX trend strength  (_add_adx) ────────────────────────────────────
-    "ADX",
-    "DMP",                    # +DI
-    "DMN",                    # -DI
-    "is_trending",            # ADX > 25
-    "adx_uptrend",            # ADX > 25 AND +DI > -DI
-    "adx_downtrend",          # ADX > 25 AND -DI > +DI
-    "DI_cross_up",            # +DI just crossed above -DI this bar
-    "DI_cross_down",          # -DI just crossed above +DI this bar
-    "ADX_slope",              # 3-bar change in ADX
-    "trend_strengthening",    # ADX slope > 0
-    "trend_weakening",        # ADX slope < 0
-    "strong_up",              # adx_uptrend AND strengthening
-    "fading_up",              # adx_uptrend AND weakening
-    "strong_down",            # adx_downtrend AND strengthening
-    "fading_down",            # adx_downtrend AND weakening
+    # # ── ADX trend strength  (_add_adx) ────────────────────────────────────
+    # "ADX",
+    # "DMP",                    # +DI
+    # "DMN",                    # -DI
+    # "is_trending",            # ADX > 25
+    # "adx_uptrend",            # ADX > 25 AND +DI > -DI
+    # "adx_downtrend",          # ADX > 25 AND -DI > +DI
+    # "DI_cross_up",            # +DI just crossed above -DI this bar
+    # "DI_cross_down",          # -DI just crossed above +DI this bar
+    # "ADX_slope",              # 3-bar change in ADX
+    # "trend_strengthening",    # ADX slope > 0
+    # "trend_weakening",        # ADX slope < 0
+    # "strong_up",              # adx_uptrend AND strengthening
+    # "fading_up",              # adx_uptrend AND weakening
+    # "strong_down",            # adx_downtrend AND strengthening
+    # "fading_down",            # adx_downtrend AND weakening
 
-    # ── MACD + Linear Regression Channel  (_add_macd_lr) ──────────────────
-    "macd_line",
-    "macd_signal",
-    "macd_hist",
-    "lr_upper",               # LR midline + 4σ
-    "lr_lower",               # LR midline − 4σ
-    "near_upper_band",        # close ≥ midline + 0.8×dev (strong bullish)
-    "near_lower_band",        # close ≤ midline − 0.8×dev (strong bearish)
-    "touches_upper",          # close ≥ upper band (stretched)
-    "touches_lower",          # close ≤ lower band (compressed)
-    "broke_above",            # just crossed above upper band
-    "broke_below",            # just crossed below lower band
-    "bands_widening",         # band width > width 3 bars ago
-    "bands_narrowing",        # band width < width 3 bars ago
-    "macd_bullish_entry",     # MACD cross up while near lower band
-    "macd_bearish_entry",     # MACD cross down while near upper band
-    "rsi",
-    "rsi_overbought",         # RSI > 70
-    "rsi_oversold",           # RSI < 30
+    # # ── MACD + Linear Regression Channel  (_add_macd_lr) ──────────────────
+    # "macd_line",
+    # "macd_signal",
+    # "macd_hist",
+    # "lr_upper",               # LR midline + 4σ
+    # "lr_lower",               # LR midline − 4σ
+    # "near_upper_band",        # close ≥ midline + 0.8×dev (strong bullish)
+    # "near_lower_band",        # close ≤ midline − 0.8×dev (strong bearish)
+    # "touches_upper",          # close ≥ upper band (stretched)
+    # "touches_lower",          # close ≤ lower band (compressed)
+    # "broke_above",            # just crossed above upper band
+    # "broke_below",            # just crossed below lower band
+    # "bands_widening",         # band width > width 3 bars ago
+    # "bands_narrowing",        # band width < width 3 bars ago
+    # "macd_bullish_entry",     # MACD cross up while near lower band
+    # "macd_bearish_entry",     # MACD cross down while near upper band
+    # "rsi",
+    # "rsi_overbought",         # RSI > 70
+    # "rsi_oversold",           # RSI < 30
 
-    # ── mean reversion  (_add_mean_reversion) ─────────────────────────────
-    "mr_below_sma20",
-    "mr_above_sma20",
-    "mr_bb_below_lower",      # below lower Bollinger Band (2σ)
-    "mr_bb_above_upper",      # above upper Bollinger Band (2σ)
-    "mr_rsi_oversold",
-    "mr_rsi_overbought",
-    "mr_z_score_low",         # Z-score < −1.5
-    "mr_z_score_high",        # Z-score >  1.5
-    "mr_below_vwap",
-    "mr_above_vwap",
+    # # ── mean reversion  (_add_mean_reversion) ─────────────────────────────
+    # "mr_below_sma20",
+    # "mr_above_sma20",
+    # "mr_bb_below_lower",      # below lower Bollinger Band (2σ)
+    # "mr_bb_above_upper",      # above upper Bollinger Band (2σ)
+    # "mr_rsi_oversold",
+    # "mr_rsi_overbought",
+    # "mr_z_score_low",         # Z-score < −1.5
+    # "mr_z_score_high",        # Z-score >  1.5
+    # "mr_below_vwap",
+    # "mr_above_vwap",
 
-    # ── momentum  (_add_momentum) ──────────────────────────────────────────
-    "mo_roc_positive_20",     # 20-bar rate-of-change > 0
-    "mo_roc_negative_20",
-    "mo_golden_cross",        # SMA50 just crossed above SMA200
-    "mo_death_cross",
-    "mo_macd_cross_up",
-    "mo_macd_cross_down",
-    "mo_adx_trending",        # ADX > 25
-    "mo_breakout_high20",     # close > 20-bar rolling high (no lookahead)
-    "mo_breakdown_low20",
-    "mo_volume_surge",        # volume > 2× 20-bar average
-    "mo_consecutive_up3",     # 3+ consecutive green bars
-    "mo_consecutive_down3",
-    "mo_combo_long",          # ≥2 of 5 bullish momentum signals firing
-    "mo_combo_short",
+    # # ── momentum  (_add_momentum) ──────────────────────────────────────────
+    # "mo_roc_positive_20",     # 20-bar rate-of-change > 0
+    # "mo_roc_negative_20",
+    # "mo_golden_cross",        # SMA50 just crossed above SMA200
+    # "mo_death_cross",
+    # "mo_macd_cross_up",
+    # "mo_macd_cross_down",
+    # "mo_adx_trending",        # ADX > 25
+    # "mo_breakout_high20",     # close > 20-bar rolling high (no lookahead)
+    # "mo_breakdown_low20",
+    # "mo_volume_surge",        # volume > 2× 20-bar average
+    # "mo_consecutive_up3",     # 3+ consecutive green bars
+    # "mo_consecutive_down3",
+    # "mo_combo_long",          # ≥2 of 5 bullish momentum signals firing
+    # "mo_combo_short",
 
-    # ── ICT liquidity sweep → FVG setups  (_add_sweep_fvg_setups) ─────────
-    "fvg_bull_top",           # top of active bullish FVG (NaN = no active zone)
-    "fvg_bull_bot",
-    "fvg_bear_top",
-    "fvg_bear_bot",
-    "in_bull_fvg",            # price is currently inside a bullish FVG
-    "in_bear_fvg",
-    "recent_low_sweep",       # low sweep within last sweep_lookback bars
-    "recent_high_sweep",
-    "setup_bull_sweep_fvg",   # recent low sweep + currently in bull FVG
-    "setup_bear_sweep_fvg",
-    "setup_bull_confirmed",   # sweep+FVG setup confirmed by green candle
-    "setup_bear_confirmed",
+    # # ── ICT liquidity sweep → FVG setups  (_add_sweep_fvg_setups) ─────────
+    # "fvg_bull_top",           # top of active bullish FVG (NaN = no active zone)
+    # "fvg_bull_bot",
+    # "fvg_bear_top",
+    # "fvg_bear_bot",
+    # "in_bull_fvg",            # price is currently inside a bullish FVG
+    # "in_bear_fvg",
+    # "recent_low_sweep",       # low sweep within last sweep_lookback bars
+    # "recent_high_sweep",
+    # "setup_bull_sweep_fvg",   # recent low sweep + currently in bull FVG
+    # "setup_bear_sweep_fvg",
+    # "setup_bull_confirmed",   # sweep+FVG setup confirmed by green candle
+    # "setup_bear_confirmed",
 
-    # ── FVG Stack + Sequential Inversion Targeting  (_add_fvg_stack_features) ─
-    "fvg_bull_stack_count",      # # active bull FVGs still in stack
-    "fvg_bear_stack_count",      # # active bear FVGs still in stack
-    "fvg_impulse_up_count",      # bull FVGs created in last stack_lookback bars (impulse strength)
-    "fvg_impulse_dn_count",      # bear FVGs created in last stack_lookback bars
+    # # ── FVG Stack + Sequential Inversion Targeting  (_add_fvg_stack_features) ─
+    # "fvg_bull_stack_count",      # # active bull FVGs still in stack
+    # "fvg_bear_stack_count",      # # active bear FVGs still in stack
+    # "fvg_impulse_up_count",      # bull FVGs created in last stack_lookback bars (impulse strength)
+    # "fvg_impulse_dn_count",      # bear FVGs created in last stack_lookback bars
 
-    "fvg_near_bull_top",         # price: top of nearest (highest) active bull FVG
-    "fvg_near_bull_bot",         # price: bottom of nearest active bull FVG
-    "fvg_near_bull_size",        # gap width of nearest bull FVG
-    "fvg_near_bull_mid",         # midpoint of nearest bull FVG
-    "fvg_near_bear_top",         # price: top of nearest (lowest) active bear FVG
-    "fvg_near_bear_bot",         # price: bottom of nearest active bear FVG
-    "fvg_near_bear_size",        # gap width of nearest bear FVG
-    "fvg_near_bear_mid",         # midpoint of nearest bear FVG
+    # "fvg_near_bull_top",         # price: top of nearest (highest) active bull FVG
+    # "fvg_near_bull_bot",         # price: bottom of nearest active bull FVG
+    # "fvg_near_bull_size",        # gap width of nearest bull FVG
+    # "fvg_near_bull_mid",         # midpoint of nearest bull FVG
+    # "fvg_near_bear_top",         # price: top of nearest (lowest) active bear FVG
+    # "fvg_near_bear_bot",         # price: bottom of nearest active bear FVG
+    # "fvg_near_bear_size",        # gap width of nearest bear FVG
+    # "fvg_near_bear_mid",         # midpoint of nearest bear FVG
 
-    "fvg_next_bull_top",         # price: 2nd bull FVG in the stack (below nearest)
-    "fvg_next_bull_bot",
-    "fvg_next_bear_top",         # price: 2nd bear FVG in the stack (above nearest)
-    "fvg_next_bear_bot",
+    # "fvg_next_bull_top",         # price: 2nd bull FVG in the stack (below nearest)
+    # "fvg_next_bull_bot",
+    # "fvg_next_bear_top",         # price: 2nd bear FVG in the stack (above nearest)
+    # "fvg_next_bear_bot",
 
-    "fvg_target_bull_top",       # price: top of the pinned bull target FVG (NaN if inactive)
-    "fvg_target_bull_bot",
-    "fvg_target_bear_top",       # price: top of the pinned bear target FVG
-    "fvg_target_bear_bot",
+    # "fvg_target_bull_top",       # price: top of the pinned bull target FVG (NaN if inactive)
+    # "fvg_target_bull_bot",
+    # "fvg_target_bear_top",       # price: top of the pinned bear target FVG
+    # "fvg_target_bear_bot",
 
-    "fvg_bull_inversion",        # 1 when nearest bull FVG inversed (close < bot)
-    "fvg_bear_inversion",        # 1 when nearest bear FVG inversed (close > top)
-    "fvg_bull_stacking",         # 1 if ≥2 active bull FVGs (impulse regime detected)
-    "fvg_bear_stacking",         # 1 if ≥2 active bear FVGs
+    # "fvg_bull_inversion",        # 1 when nearest bull FVG inversed (close < bot)
+    # "fvg_bear_inversion",        # 1 when nearest bear FVG inversed (close > top)
+    # "fvg_bull_stacking",         # 1 if ≥2 active bull FVGs (impulse regime detected)
+    # "fvg_bear_stacking",         # 1 if ≥2 active bear FVGs
 
-    "fvg_targeting_next_bull",   # 1 while in post-inversion targeting state (bull)
-    "fvg_targeting_next_bear",   # 1 while in post-inversion targeting state (bear)
-    "fvg_at_next_bull",          # 1 when price first arrives at the next bull FVG target
-    "fvg_at_next_bear",          # 1 when price first arrives at the next bear FVG target
+    # "fvg_targeting_next_bull",   # 1 while in post-inversion targeting state (bull)
+    # "fvg_targeting_next_bear",   # 1 while in post-inversion targeting state (bear)
+    # "fvg_at_next_bull",          # 1 when price first arrives at the next bull FVG target
+    # "fvg_at_next_bear",          # 1 when price first arrives at the next bear FVG target
 
-    "fvg_dist_to_near_bull",     # (close − near_top) / close; neg = price inside or below zone
-    "fvg_dist_to_near_bear",     # (near_bot − close) / close; neg = price inside or above zone
-    "fvg_dist_to_target_bull",   # normalized distance to active bull target (NaN if inactive)
-    "fvg_dist_to_target_bear",   # normalized distance to active bear target
+    # "fvg_dist_to_near_bull",     # (close − near_top) / close; neg = price inside or below zone
+    # "fvg_dist_to_near_bear",     # (near_bot − close) / close; neg = price inside or above zone
+    # "fvg_dist_to_target_bull",   # normalized distance to active bull target (NaN if inactive)
+    # "fvg_dist_to_target_bear",   # normalized distance to active bear target
 
-    "fvg_bull_inv_with_target",  # inversion fired AND next-target FVG exists — the core setup
-    "fvg_bear_inv_with_target",
+    # "fvg_bull_inv_with_target",  # inversion fired AND next-target FVG exists — the core setup
+    # "fvg_bear_inv_with_target",
 
-    # ── SPY / QQQ index divergence  (_add_index_divergence) ───────────────
-    "spy_ret",                # SPY bar-over-bar return
-    "qqq_ret",                # QQQ bar-over-bar return
-    "idx_div_spy_up_qqq_down",
-    "idx_div_spy_down_qqq_up",
-    "idx_div_any",
-    "idx_div_rolling3",       # divergence persisted in any of last 3 bars
-    "idx_corr_20",            # 20-bar rolling SPY/QQQ correlation
-    "idx_corr_breakdown",     # rolling correlation < 0.5 (regime decoupling)
+    # # ── SPY / QQQ index divergence  (_add_index_divergence) ───────────────
+    # "spy_ret",                # SPY bar-over-bar return
+    # "qqq_ret",                # QQQ bar-over-bar return
+    # "idx_div_spy_up_qqq_down",
+    # "idx_div_spy_down_qqq_up",
+    # "idx_div_any",
+    # "idx_div_rolling3",       # divergence persisted in any of last 3 bars
+    # "idx_corr_20",            # 20-bar rolling SPY/QQQ correlation
+    # "idx_corr_breakdown",     # rolling correlation < 0.5 (regime decoupling)
+
+    # ── ICT breaker blocks — double inverse  (_add_breaker_block_features) ─
+    "breaker_bull_double_inverse_1m",   # bullish reclaim of a bearish breaker, 1m
+    "breaker_bear_double_inverse_1m",   # bearish reclaim of a bullish breaker, 1m
+    "breaker_bull_double_inverse_5m",
+    "breaker_bear_double_inverse_5m",
+    "breaker_bull_double_inverse_15m",
+    "breaker_bear_double_inverse_15m",
+    "breaker_bull_double_inverse_any",  # fired on ANY of the 3 timeframes
+    "breaker_bear_double_inverse_any",
 
     # ── FinBERT / Finnhub news sentiment  (step 3 — optional) ─────────────
     # Only present when USE_NEWS_SENTIMENT = True.

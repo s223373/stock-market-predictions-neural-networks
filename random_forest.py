@@ -1,5 +1,5 @@
 """
-random_forest_model.py
+random_forest.py
 ======================
 Supercharged Random Forest classifier for BUY / HOLD / SELL prediction.
 
@@ -50,10 +50,9 @@ from sklearn.calibration    import CalibratedClassifierCV
 from sklearn.ensemble       import RandomForestClassifier
 from sklearn.metrics        import classification_report, confusion_matrix
 from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
-from scipy.stats              import randint, uniform
 from sklearn.pipeline       import Pipeline
 
-from dataset_builder  import build_labeled_dataset
+from dataset_builder import build_labeled_dataset
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -69,9 +68,6 @@ INTERVAL        = "5m"
 TRAIN_FRAC      = 0.70   # oldest 70 % → hyperparameter tuning
 CAL_FRAC        = 0.15   # next  15 % → probability calibration
 # TEST_FRAC     = 0.15   # final 15 % → held-out evaluation (implicit)
-
-# Cross-validation inside the training fold
-CV_SPLITS       = 5      # TimeSeriesSplit folds
 
 # RandomizedSearchCV — samples the hyperparameter space rather than exhausting
 # it, giving near-equivalent coverage in a fraction of the time.
@@ -89,10 +85,10 @@ CV_SPLITS       = 3      # TimeSeriesSplit folds inside training set
 PARAM_DIST = {
     # Trees: higher is better but with diminishing returns above ~500.
     # randint samples any integer in [low, high).
-    "n_estimators"     : randint(200, 1001),
+    "n_estimators"     : [3],
 
     # Depth: None = fully grown (can overfit); integers limit tree depth.
-    "max_depth"        : [None, 10, 20, 30, 50],
+    "max_depth"        : [3],
 
     # Splitting constraints — higher values regularise against overfitting.
     "min_samples_split": randint(2, 25),
@@ -136,24 +132,26 @@ SELL = 0
 
 def load_and_prepare(ticker=TICKER, period=PERIOD, interval=INTERVAL):
     """
-    Build the labeled dataset, apply the FEATURES filter from
-    feature_engineering.py, and return a clean (X, y) pair in
-    chronological order with the datetime index preserved as a column.
+    Build the labeled dataset and return a clean (X, y) pair in chronological
+    order with the datetime index preserved as a column.
+
+    No separate feature filtering happens here — build_labeled_dataset()
+    already restricts its output to Close + whichever boolean columns are
+    derived from feature_engineering.FEATURES (+ news cols, if enabled), so
+    whatever is uncommented in that one list is exactly what X ends up with.
+    Comment/uncomment entries in feature_engineering.FEATURES to control
+    what this model trains on — there's nothing to change here.
     """
     print("── Loading dataset ──────────────────────────────────────")
     labeled = build_labeled_dataset(ticker=ticker, period=period, interval=interval)
     df      = labeled.reset_index()   # brings Datetime out of the index
 
-    # Use every boolean feature the labeled dataset contains.
-    # build_labeled_dataset() already filters to Close + BOOLEAN_FEATURE_COLS + target,
-    # so dropping Datetime, Close, and target leaves the full boolean feature matrix.
-    # Do NOT filter by FEATURES from feature_engineering.py — that list reflects
-    # whichever features are uncommented there and may be a small subset.
     drop = [c for c in ["Datetime", "Close", "target"] if c in df.columns]
     X    = df.drop(columns=drop)
     y    = df["target"]
 
     print(f"   Feature matrix : {X.shape[0]:,} rows × {X.shape[1]} cols")
+    print(f"   Features used  : {list(X.columns)}")
     print(f"   Class counts   : {dict(y.value_counts().sort_index())}")
     return X, y
 
