@@ -36,13 +36,72 @@ TIMEFRAME_PERIODS = {
     "15m": "60d",
 }
 
-# Which 2 columns belong to which timeframe's tree — used by
-# load_and_prepare() to narrow each per-timeframe dataframe down to just
-# its own bull/bear breaker-block pair.
-TIMEFRAME_FEATURES = {
+# Features that mean the same thing regardless of timeframe — each
+# per-timeframe dataframe computes its OWN native version of these under
+# the same column name (e.g. the 1m dataframe's "is_trending" is ADX-based
+# on 1-minute bars; the 5m dataframe's "is_trending" is the same indicator
+# computed on 5-minute bars). Add or remove entries here to change what
+# EVERY tree sees, in one place.
+#
+# IMPORTANT: every entry here must be a column that survives
+# dataset_builder.py's boolean-only filter (_is_binary_col). Continuous
+# indicators — ADX, rsi, macd_line, lr_upper/lower, any raw price level
+# like fvg_bull_top, or FVG stack counts (0,1,2,3...) — never make it into
+# the dataframe build_labeled_dataset() returns, no matter what's
+# uncommented in feature_engineering.FEATURES. Listing one here won't
+# error loudly — load_and_prepare() below just silently drops it and warns.
+# Keep this in sync with whatever's uncommented (and boolean) in
+# feature_engineering.FEATURES.
+SHARED_FEATURES = [
+    "high_wick_sweep", "low_wick_sweep",
+    "isGreen", "isHigh", "isLow",
+    "trend_ranging", "trend_uptrend",
+    "is_trending", "adx_uptrend", "adx_downtrend",
+    "DI_cross_up", "DI_cross_down",
+    "trend_strengthening", "trend_weakening",
+    "strong_up", "fading_up", "strong_down", "fading_down",
+    "near_upper_band", "near_lower_band", "touches_upper", "touches_lower",
+    "broke_above", "broke_below", "bands_widening", "bands_narrowing",
+    "macd_bullish_entry", "macd_bearish_entry",
+    "rsi_overbought", "rsi_oversold",
+    "mr_below_sma20", "mr_above_sma20",
+    "mr_bb_below_lower", "mr_bb_above_upper",
+    "mr_rsi_oversold", "mr_rsi_overbought",
+    "mr_z_score_low", "mr_z_score_high",
+    "mr_below_vwap", "mr_above_vwap",
+    "mo_roc_positive_20", "mo_roc_negative_20",
+    "mo_golden_cross", "mo_death_cross",
+    "mo_macd_cross_up", "mo_macd_cross_down",
+    "mo_adx_trending", "mo_breakout_high20", "mo_breakdown_low20",
+    "mo_volume_surge", "mo_consecutive_up3", "mo_consecutive_down3",
+    "mo_combo_long", "mo_combo_short",
+    "in_bull_fvg", "in_bear_fvg",
+    "recent_low_sweep", "recent_high_sweep",
+    "setup_bull_sweep_fvg", "setup_bear_sweep_fvg",
+    "setup_bull_confirmed", "setup_bear_confirmed",
+    "fvg_bull_inversion", "fvg_bear_inversion",
+    "fvg_bull_stacking", "fvg_bear_stacking",
+    "fvg_targeting_next_bull", "fvg_targeting_next_bear",
+    "fvg_at_next_bull", "fvg_at_next_bear",
+    "fvg_bull_inv_with_target", "fvg_bear_inv_with_target",
+    "idx_div_spy_up_qqq_down", "idx_div_spy_down_qqq_up",
+    "idx_div_any", "idx_div_rolling3", "idx_corr_breakdown",
+]
+
+# Which 2 breaker columns belong to which timeframe's tree, kept separate
+# from SHARED_FEATURES since these are the one category that must NOT be
+# shared — giving the 1m tree visibility into the 5m/15m breaker columns
+# would leak other-timeframe information into what's supposed to be an
+# isolated, timeframe-specific signal.
+TIMEFRAME_BREAKER_PAIR = {
     "1m":  ["breaker_bull_double_inverse_1m",  "breaker_bear_double_inverse_1m"],
     "5m":  ["breaker_bull_double_inverse_5m",  "breaker_bear_double_inverse_5m"],
     "15m": ["breaker_bull_double_inverse_15m", "breaker_bear_double_inverse_15m"],
+}
+
+TIMEFRAME_FEATURES = {
+    tf: SHARED_FEATURES + pair
+    for tf, pair in TIMEFRAME_BREAKER_PAIR.items()
 }
 
 # Split fractions (must sum to 1.0); all chronological — no shuffling
@@ -55,17 +114,18 @@ N_ITER          = 40     # unused now that this uses GridSearchCV, not
                           # RandomizedSearchCV — left in case you switch back
 CV_SPLITS       = 3      # TimeSeriesSplit folds inside training set
 
-# Each tree only ever sees 2 binary features, so there's a hard ceiling on
-# how much it can learn — but max_depth=[1] (the previous setting) capped
-# it at ONE split total, meaning it could only ever look at ONE of its two
-# features and completely ignored the other. max_depth=2 lets it split on
-# both; None lets sklearn stop naturally once splits stop being useful
-# (with only 2 binary inputs there's no real overfitting risk from that).
+# Each tree now sees SHARED_FEATURES (~80 boolean columns) plus its own
+# timeframe's 2 breaker columns — no longer the narrow 2-feature case this
+# grid was originally sized for. With this many inputs there's real
+# overfitting risk (unlike the old 2-feature case, where every leaf was
+# already forced to use both), so max_depth, min_samples_leaf/split, and
+# max_features all genuinely matter here.
 PARAM_DIST = {
     "criterion"        : ["gini", "entropy"],
-    "max_depth"        : [2],
+    "max_depth"        : [7],
     "min_samples_leaf" : [1, 5, 10, 20],
     "min_samples_split": [2, 10, 20],
+    "max_features"     : ["sqrt", "log2", None],
 }
 
 # Feature pruning — not used by this file's per-timeframe trees (each tree
@@ -144,12 +204,19 @@ def load_and_prepare(df, interval=INTERVAL):
     """
     print(f"── Loading dataset ({interval}) ──────────────────────────")
 
-    features = [c for c in TIMEFRAME_FEATURES.get(interval, []) if c in df.columns]
+    requested = TIMEFRAME_FEATURES.get(interval, [])
+    features  = [c for c in requested if c in df.columns]
+    missing   = [c for c in requested if c not in df.columns]
+
+    if missing:
+        print(f"  ⚠  {len(missing)} requested column(s) not found and skipped: {missing}")
+        print(f"     (continuous indicators like ADX/rsi/macd_line/price levels never "
+              f"survive dataset_builder.py's boolean-only filter — only list boolean "
+              f"FEATURES entries in SHARED_FEATURES.)")
     if not features:
         raise ValueError(
             f"No columns found for interval='{interval}'. Expected "
-            f"{TIMEFRAME_FEATURES.get(interval)} — check FEATURES in "
-            f"feature_engineering.py."
+            f"{requested} — check FEATURES in feature_engineering.py."
         )
 
     X = df[features].copy()

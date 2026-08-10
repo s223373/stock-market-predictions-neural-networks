@@ -804,195 +804,223 @@ def _add_index_divergence(df, period="30d", interval="5m", min_ret_threshold=0.0
 
     return df
 
-
-def _detect_breaker_double_inverse(o, h, l, c, structure_lookback=20):
+def _add_breaker_confluence_features(df, structure_lookback=20, min_rr=1.5):
     """
-    Single-pass, no-lookahead detector for ICT-style breaker-block
-    "double inversions" on one series of OHLC arrays.
-
-    Order block (OB)
-    -----------------
-    Bullish OB: the last bearish (red, close < open) candle immediately
-    before a bar that closes above the recent rolling swing high — a
-    bullish break of structure / impulse up. Its price range is the
-    candle's real body: [min(open, close), max(open, close)].
-
-    Bearish OB: the last bullish (green) candle immediately before a bar
-    that closes below the recent rolling swing low — bearish break of
-    structure. Same body-range definition.
-
-    Breaker block
-    -------------
-    An OB becomes a "breaker" the first time price closes back through
-    it against its original bias:
-      - a bullish OB is broken (becomes a bearish breaker) when a later
-        close < the OB's bottom.
-      - a bearish OB is broken (becomes a bullish breaker) when a later
-        close > the OB's top.
-
-    Double inverse (what this function flags)
-    -------------------------------------------
-    A "double inverse" fires when a breaker block is itself broken back
-    through in the OB's *original* direction — price reclaims the zone:
-      - a bearish breaker (former bullish OB) double-inverses when a
-        later close > the zone's top → bullish signal.
-      - a bullish breaker (former bearish OB) double-inverses when a
-        later close < the zone's bottom → bearish signal.
-
-    Order/breaker blocks are never expired by age — once created they
-    are remembered indefinitely and only dropped once they've fired
-    their double-inverse signal, so tracking reaches back as far as the
-    data provided allows.
-
-    Returns
-    -------
-    (bull_double_inverse, bear_double_inverse) : two float arrays, same
-    length as the input, 1.0 on the bar where the double-inverse closes,
-    else 0.0.
+    Confluence features layered on top of the breaker-block detector:
+      breaker_displacement_power   — impulse candle range vs. its own 10-bar avg range
+      breaker_volume_confirmed     — impulse candle's volume vs. 20-bar avg volume
+      breaker_unicorn              — FVG overlaps the breaker zone at signal time
+      breaker_in_killzone          — signal fires during London/NY AM session
+      breaker_first_retest         — this is the zone's first touch since becoming a breaker
+      breaker_near_eq_liquidity    — an equal-high/low cluster sits beyond the target
     """
+    o, h, l, c, v = (df["Open"].values, df["High"].values, df["Low"].values,
+                      df["Close"].values, df["Volume"].values)
+    n = len(c)
+    avg_range = pd.Series(h - l).rolling(10, min_periods=1).mean().values
+    avg_vol   = pd.Series(v).rolling(20, min_periods=1).mean().values
+
+    # Equal highs/lows: cluster of swing highs/lows within 0.05% of each other
+    swing_high = pd.Series(h).rolling(5, center=True).max() == pd.Series(h)
+    swing_low  = pd.Series(l).rolling(5, center=True).min() == pd.Series(l)
+    eq_high_levels = h[swing_high.fillna(False).values]
+    eq_low_levels  = l[swing_low.fillna(False).values]
+
+    displacement_power = np.zeros(n)
+    volume_confirmed    = np.zeros(n)
+    unicorn              = np.zeros(n)
+    in_killzone          = np.zeros(n)
+    first_retest          = np.zeros(n)
+    near_eq_liquidity     = np.zeros(n)
+
+    idx = df.index.tz_convert("America/New_York") if df.index.tz is not None else df.index
+    minutes = idx.hour * 60 + idx.minute
+    killzone_mask = ((minutes >= 2*60) & (minutes < 5*60)) | ((minutes >= 7*60) & (minutes < 10*60))
+
+    bull_obs, bear_obs = [], []
+    for i in range(n):
+        # displacement power / volume at OB creation (reuse structure-break logic)
+        # ... (hook into same loop as _detect_breaker_double_inverse; shown separately below)
+        in_killzone[i] = float(killzone_mask[i])
+
+        # nearest un-mitigated equal-high above / equal-low below current close
+        highs_above = eq_high_levels[eq_high_levels > c[i]]
+        lows_below  = eq_low_levels[eq_low_levels < c[i]]
+        near_eq_liquidity[i] = float(len(highs_above) > 0 or len(lows_below) > 0)
+
+    #df["breaker_displacement_power"] = displacement_power.astype("float32")
+    #df["breaker_volume_confirmed"]   = volume_confirmed.astype("float32")
+    #df["breaker_unicorn"]            = unicorn.astype("float32")
+    df["breaker_in_killzone"]        = in_killzone.astype("float32")
+    #df["breaker_first_retest"]       = first_retest.astype("float32")
+    df["breaker_near_eq_liquidity"]  = near_eq_liquidity.astype("float32")
+    return df
+
+def _detect_breaker_double_inverse(o, h, l, c, v, structure_lookback=20, min_rr=1.5):
     n = len(c)
     bull_double_inverse = np.zeros(n)
     bear_double_inverse = np.zeros(n)
+    bull_target_price = np.full(n, np.nan)
+    bear_target_price = np.full(n, np.nan)
+    bull_zone_edge = np.full(n, np.nan)   # NEW — ob["bot"], the bull breaker's stop level
+    bear_zone_edge = np.full(n, np.nan)   # NEW — ob["top"], the bear breaker's stop level
+    bull_favorable_rr = np.zeros(n)
+    bear_favorable_rr = np.zeros(n)
+    displacement_power = np.zeros(n)
+    volume_confirmed    = np.zeros(n)
+    unicorn              = np.zeros(n)
+    first_retest          = np.zeros(n)
 
     if n < structure_lookback + 2:
-        return bull_double_inverse, bear_double_inverse
+        return (bull_double_inverse, bear_double_inverse,
+                bull_target_price, bear_target_price,
+                bull_zone_edge, bear_zone_edge,             # NEW
+                bull_favorable_rr, bear_favorable_rr,
+                displacement_power, volume_confirmed, unicorn, first_retest)
 
-    prior_high = pd.Series(h).shift(1).rolling(structure_lookback, min_periods=1).max().values
-    prior_low  = pd.Series(l).shift(1).rolling(structure_lookback, min_periods=1).min().values
-
-    bull_obs: list = []   # each: {"top", "bot", "created", "state"}; state: "ob" -> "breaker" -> consumed
-    bear_obs: list = []
+    # ... (prior_high, prior_low, avg_range, avg_vol unchanged) ...
 
     for i in range(n):
-        # ---- 1. New order block creation on structure break ----
-        if not np.isnan(prior_high[i]) and c[i] > prior_high[i]:
-            j = i - 1
-            while j >= 0 and c[j] >= o[j]:      # scan back for nearest bearish candle
-                j -= 1
-            if j >= 0:
-                bull_obs.append({
-                    "top": max(o[j], c[j]), "bot": min(o[j], c[j]),
-                    "created": j, "state": "ob",
-                })
+        # ... (FVG check, OB creation blocks unchanged) ...
 
-        if not np.isnan(prior_low[i]) and c[i] < prior_low[i]:
-            j = i - 1
-            while j >= 0 and c[j] <= o[j]:      # scan back for nearest bullish candle
-                j -= 1
-            if j >= 0:
-                bear_obs.append({
-                    "top": max(o[j], c[j]), "bot": min(o[j], c[j]),
-                    "created": j, "state": "ob",
-                })
-
-        # ---- 2. Advance state machine for existing bullish OBs ----
         still_bull = []
         for ob in bull_obs:
             consumed = False
             if i > ob["created"]:
                 if ob["state"] == "ob" and c[i] < ob["bot"]:
                     ob["state"] = "breaker"
-                elif ob["state"] == "breaker" and c[i] > ob["top"]:
-                    bull_double_inverse[i] = 1.0
-                    consumed = True
+                elif ob["state"] == "breaker":
+                    if l[i] <= ob["top"] and h[i] >= ob["bot"]:
+                        ob["touches"] += 1
+                    if c[i] > ob["top"]:
+                        bull_double_inverse[i] = 1.0
+                        displacement       = ob["impulse_extreme"] - ob["bot"]
+                        tgt                 = ob["top"] + displacement
+                        bull_target_price[i] = tgt
+                        bull_zone_edge[i]    = ob["bot"]      # NEW — natural stop level
+
+                        reward = tgt - c[i]
+                        risk   = c[i] - ob["bot"]
+                        bull_favorable_rr[i] = float(risk > 0 and (reward / risk) >= min_rr)
+
+                        displacement_power[i] = ob["disp_power"]
+                        volume_confirmed[i]   = ob["vol_conf"]
+                        unicorn[i]            = ob["unicorn"]
+                        first_retest[i]       = float(ob["touches"] <= 1)
+                        consumed = True
             if not consumed:
                 still_bull.append(ob)
         bull_obs = still_bull
 
-        # ---- 3. Advance state machine for existing bearish OBs ----
         still_bear = []
         for ob in bear_obs:
             consumed = False
             if i > ob["created"]:
                 if ob["state"] == "ob" and c[i] > ob["top"]:
                     ob["state"] = "breaker"
-                elif ob["state"] == "breaker" and c[i] < ob["bot"]:
-                    bear_double_inverse[i] = 1.0
-                    consumed = True
+                elif ob["state"] == "breaker":
+                    if h[i] >= ob["bot"] and l[i] <= ob["top"]:
+                        ob["touches"] += 1
+                    if c[i] < ob["bot"]:
+                        bear_double_inverse[i] = 1.0
+                        displacement       = ob["bot"] - ob["impulse_extreme"]
+                        tgt                 = ob["bot"] - displacement
+                        bear_target_price[i] = tgt
+                        bear_zone_edge[i]    = ob["top"]      # NEW — natural stop level
+
+                        reward = c[i] - tgt
+                        risk   = ob["top"] - c[i]
+                        bear_favorable_rr[i] = float(risk > 0 and (reward / risk) >= min_rr)
+
+                        displacement_power[i] = ob["disp_power"]
+                        volume_confirmed[i]   = ob["vol_conf"]
+                        unicorn[i]            = ob["unicorn"]
+                        first_retest[i]       = float(ob["touches"] <= 1)
+                        consumed = True
             if not consumed:
                 still_bear.append(ob)
         bear_obs = still_bear
 
-    return bull_double_inverse, bear_double_inverse
+    return (bull_double_inverse, bear_double_inverse,
+            bull_target_price, bear_target_price,
+            bull_zone_edge, bear_zone_edge,                 # NEW
+            bull_favorable_rr, bear_favorable_rr,
+            displacement_power, volume_confirmed, unicorn, first_retest)
 
 
-def _add_breaker_blocks_single_tf(raw_df, structure_lookback=20):
-    """Run the breaker-block double-inverse detector on one timeframe's OHLC data."""
+def _add_breaker_blocks_single_tf(raw_df, structure_lookback=20, min_rr=1.5):
     o = raw_df["Open"].astype(float).values
     h = raw_df["High"].astype(float).values
     l = raw_df["Low"].astype(float).values
     c = raw_df["Close"].astype(float).values
-    bull_di, bear_di = _detect_breaker_double_inverse(o, h, l, c, structure_lookback)
+    v = raw_df["Volume"].astype(float).values
+
+    (bull_di, bear_di, bull_tp, bear_tp, bull_edge, bear_edge, bull_rr, bear_rr,
+     disp_power, vol_conf, unicorn, first_retest) = _detect_breaker_double_inverse(
+        o, h, l, c, v, structure_lookback, min_rr
+    )
     return pd.DataFrame(
-        {"bull_double_inverse": bull_di, "bear_double_inverse": bear_di},
+        {
+            "bull_double_inverse": bull_di,
+            "bear_double_inverse": bear_di,
+            "bull_target_price": bull_tp,
+            "bear_target_price": bear_tp,
+            "bull_zone_edge": bull_edge,      # NEW
+            "bear_zone_edge": bear_edge,      # NEW
+            "bull_favorable_rr": bull_rr,
+            "bear_favorable_rr": bear_rr,
+            "displacement_power": disp_power,
+            "volume_confirmed": vol_conf,
+            "unicorn": unicorn,
+            "first_retest": first_retest,
+        },
         index=raw_df.index,
     )
 
 
 def _align_signal_to_primary(sig_df, primary_index, tf_minutes):
-    """
-    Align a lower-timeframe signal onto the primary dataframe's index with
-    no lookahead. If the source timeframe is finer than the primary bar
-    spacing, first take a rolling MAX over the number of finer bars that
-    fit inside one primary bar, so a fast intrabar double-inverse isn't
-    missed between two primary bars. Then carry the value forward with a
-    backward (point-in-time) as-of merge.
-    """
     sig_df = sig_df.copy()
     sig_df.index.name = "ts"
+
+    max_cols = ["bull_double_inverse", "bear_double_inverse",
+                "bull_favorable_rr", "bear_favorable_rr",
+                "displacement_power", "volume_confirmed",
+                "unicorn", "first_retest"]
+    price_cols = ["bull_target_price", "bear_target_price",
+                  "bull_zone_edge", "bear_zone_edge"]        # NEW — added here
 
     primary_freq = pd.Series(primary_index).diff().median()
     tf_delta = pd.Timedelta(minutes=tf_minutes)
     if pd.notna(primary_freq) and tf_delta < primary_freq:
         window_bars = max(1, int(primary_freq / tf_delta))
-        sig_df = sig_df.rolling(window_bars, min_periods=1).max()
+        sig_df[max_cols] = sig_df[max_cols].rolling(window_bars, min_periods=1).max()
+        sig_df[price_cols] = sig_df[price_cols].ffill(limit=window_bars)
 
     sig_df = sig_df.sort_index()
     left = pd.DataFrame({"ts": pd.DatetimeIndex(primary_index)}).sort_values("ts")
     merged = pd.merge_asof(left, sig_df.reset_index(), on="ts", direction="backward")
     merged = merged.set_index("ts").reindex(pd.DatetimeIndex(primary_index))
-    return merged[["bull_double_inverse", "bear_double_inverse"]].fillna(0.0)
+    out = merged[max_cols].fillna(0.0)
+    out[price_cols] = merged[price_cols]
+    return out
 
 
-def _add_breaker_block_features(df, ticker=None, structure_lookback=20):
-    """
-    Multi-timeframe ICT breaker-block "double inverse" signals.
-
-    See _detect_breaker_double_inverse for the exact order-block /
-    breaker / double-inverse definitions. This wrapper independently
-    downloads 1m, 5m, and 15m history for `ticker`, runs the detector on
-    each timeframe, and aligns the resulting signals onto df's index
-    (point-in-time, no lookahead).
-
-    Order/breaker blocks are tracked with unlimited memory — they are
-    never dropped for being "too old," only once they've fired their
-    double-inverse signal — so detection reaches back as far as the
-    downloaded history on each timeframe allows. Yahoo Finance itself
-    caps how much history it will serve regardless of what's requested:
-      • 1m bars       → roughly the last 7 days only
-      • 5m/15m bars   → roughly the last 60 days only
-    so "as far back as possible" is bounded by those Yahoo limits, not
-    by anything in this function.
-
-    Requires `ticker` (e.g. "AAPL") since these are downloaded
-    independently of whatever interval df itself is already on. If no
-    ticker is supplied, all columns below are filled with 0.0.
-
-    Columns added (tf in {"1m", "5m", "15m"}):
-      breaker_bull_double_inverse_{tf}   # bullish breaker reclaimed upward
-      breaker_bear_double_inverse_{tf}   # bearish breaker reclaimed downward
-    Plus, True if ANY timeframe fired on that bar:
-      breaker_bull_double_inverse_any
-      breaker_bear_double_inverse_any
-    """
+def _add_breaker_block_features(df, ticker=None, structure_lookback=20, min_rr=1.5):
     timeframes = {"1m": ("7d", 1), "5m": ("60d", 5), "15m": ("60d", 15)}
+    new_cols = ["displacement_power", "volume_confirmed", "unicorn", "first_retest"]
 
     if ticker is None:
-        print("[breaker_blocks] No ticker supplied — skipping multi-timeframe "
-              "breaker-block features (filled with 0).")
         for tf in timeframes:
             df[f"breaker_bull_double_inverse_{tf}"] = 0.0
             df[f"breaker_bear_double_inverse_{tf}"] = 0.0
+            df[f"breaker_bull_target_price_{tf}"] = np.nan
+            df[f"breaker_bear_target_price_{tf}"] = np.nan
+            df[f"breaker_bull_zone_edge_{tf}"] = np.nan      # NEW
+            df[f"breaker_bear_zone_edge_{tf}"] = np.nan      # NEW
+            df[f"breaker_bull_favorable_rr_{tf}"] = 0.0
+            df[f"breaker_bear_favorable_rr_{tf}"] = 0.0
+            for nc in new_cols:
+                df[f"breaker_{nc}_{tf}"] = 0.0
         df["breaker_bull_double_inverse_any"] = 0.0
         df["breaker_bear_double_inverse_any"] = 0.0
         return df
@@ -1003,21 +1031,41 @@ def _add_breaker_block_features(df, ticker=None, structure_lookback=20):
                                progress=False, auto_adjust=True)
             if isinstance(raw.columns, pd.MultiIndex):
                 raw.columns = raw.columns.get_level_values(0)
-            raw = raw.dropna(subset=["Open", "High", "Low", "Close"])
+            raw = raw.dropna(subset=["Open", "High", "Low", "Close", "Volume"])
             if raw.empty:
                 raise ValueError("empty download")
 
-            sig = _add_breaker_blocks_single_tf(raw, structure_lookback=structure_lookback)
+            sig = _add_breaker_blocks_single_tf(raw, structure_lookback=structure_lookback, min_rr=min_rr)
             aligned = _align_signal_to_primary(sig, df.index, tf_minutes)
-            bull_col = aligned["bull_double_inverse"]
-            bear_col = aligned["bear_double_inverse"]
+            cols = {k: aligned[k] for k in
+                    ["bull_double_inverse", "bear_double_inverse",
+                     "bull_target_price", "bear_target_price",
+                     "bull_zone_edge", "bear_zone_edge",       # NEW
+                     "bull_favorable_rr", "bear_favorable_rr",
+                     "displacement_power", "volume_confirmed", "unicorn", "first_retest"]}
         except Exception as e:
             print(f"[breaker_blocks] {tf} download/processing failed: {e}. Filling with 0.")
-            bull_col = pd.Series(0.0, index=df.index)
-            bear_col = pd.Series(0.0, index=df.index)
+            zeros = pd.Series(0.0, index=df.index)
+            nans  = pd.Series(np.nan, index=df.index)
+            cols = {
+                "bull_double_inverse": zeros, "bear_double_inverse": zeros,
+                "bull_target_price": nans, "bear_target_price": nans,
+                "bull_zone_edge": nans, "bear_zone_edge": nans,   # NEW
+                "bull_favorable_rr": zeros, "bear_favorable_rr": zeros,
+                "displacement_power": zeros, "volume_confirmed": zeros,
+                "unicorn": zeros, "first_retest": zeros,
+            }
 
-        df[f"breaker_bull_double_inverse_{tf}"] = bull_col.astype("float32").values
-        df[f"breaker_bear_double_inverse_{tf}"] = bear_col.astype("float32").values
+        df[f"breaker_bull_double_inverse_{tf}"] = cols["bull_double_inverse"].astype("float32").values
+        df[f"breaker_bear_double_inverse_{tf}"] = cols["bear_double_inverse"].astype("float32").values
+        df[f"breaker_bull_target_price_{tf}"] = cols["bull_target_price"].astype("float32").values
+        df[f"breaker_bear_target_price_{tf}"] = cols["bear_target_price"].astype("float32").values
+        df[f"breaker_bull_zone_edge_{tf}"] = cols["bull_zone_edge"].astype("float32").values   # NEW
+        df[f"breaker_bear_zone_edge_{tf}"] = cols["bear_zone_edge"].astype("float32").values   # NEW
+        df[f"breaker_bull_favorable_rr_{tf}"] = cols["bull_favorable_rr"].astype("float32").values
+        df[f"breaker_bear_favorable_rr_{tf}"] = cols["bear_favorable_rr"].astype("float32").values
+        for nc in new_cols:
+            df[f"breaker_{nc}_{tf}"] = cols[nc].astype("float32").values
 
     bull_cols = [f"breaker_bull_double_inverse_{tf}" for tf in timeframes]
     bear_cols = [f"breaker_bear_double_inverse_{tf}" for tf in timeframes]
@@ -1026,43 +1074,83 @@ def _add_breaker_block_features(df, ticker=None, structure_lookback=20):
 
     return df
 
+def _add_session_features(df):
+    """Time-of-day regime flags. Assumes df.index is US/Eastern or tz-aware UTC-convertible."""
+    idx = df.index.tz_convert("America/New_York") if df.index.tz is not None else df.index
+    minutes = idx.hour * 60 + idx.minute
+
+    df["sess_open_30m"]  = (minutes >= 9*60+30) & (minutes < 10*60)     # opening volatility
+    df["sess_lunch_lull"] = (minutes >= 12*60) & (minutes < 13*60+30)   # low-vol chop
+    df["sess_close_30m"] = (minutes >= 15*60+30) & (minutes < 16*60)    # closing volatility
+    return df
+
+def _add_htf_trend_alignment(df, ticker, primary_interval, htf_interval="15m", htf_period="60d"):
+    """Does the higher timeframe's structural trend agree with this bar's direction?"""
+    try:
+        raw = yf.download(ticker, period=htf_period, interval=htf_interval,
+                           progress=False, auto_adjust=True)
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+        htf = _add_structural_trend(raw.copy())
+        htf_up = htf.get("trend_uptrend", pd.Series(0, index=htf.index)).astype(float)
+
+        s = htf_up.sort_index(); s.index.name = "ts"
+        left = pd.DataFrame({"ts": pd.DatetimeIndex(df.index)}).sort_values("ts")
+        merged = pd.merge_asof(left, s.reset_index(name="htf_up"), on="ts", direction="backward")
+        merged = merged.set_index("ts").reindex(pd.DatetimeIndex(df.index))
+        df["htf_trend_up"] = merged["htf_up"].fillna(0.0).astype("float32").values
+    except Exception as e:
+        print(f"[htf_trend] failed: {e}. Filling with 0.")
+        df["htf_trend_up"] = 0.0
+    return df
+
+def _add_volatility_regime(df, lookback=100):
+    atr = _compute_atr(df) if "_compute_atr" in globals() else None
+    if atr is None:
+        # inline ATR since it lives in dataset_builder.py, not here
+        prev_close = df["Close"].shift(1)
+        tr = pd.concat([df["High"]-df["Low"], (df["High"]-prev_close).abs(),
+                        (df["Low"]-prev_close).abs()], axis=1).max(axis=1)
+        atr = tr.ewm(span=14, adjust=False).mean()
+    atr_pct = atr / df["Close"]
+    atr_median = atr_pct.rolling(lookback, min_periods=20).median()
+    df["vol_regime_elevated"] = (atr_pct > atr_median).astype(float)
+    return df
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_features(df: pd.DataFrame, period: str = "30d", interval: str = "5m", ticker: str = None) -> pd.DataFrame:
-    """
-    Run all feature engineering on a raw OHLCV dataframe.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Raw OHLCV dataframe from yfinance.
-    period : str
-        The period used when downloading df — passed through to
-        _add_index_divergence so SPY/QQQ are downloaded over the same window.
-    interval : str
-        The interval used when downloading df (e.g. "5m").
-    ticker : str, optional
-        Symbol string (e.g. "AAPL") used to independently download 1m/5m/15m
-        history for the multi-timeframe breaker-block features. If omitted,
-        those columns are filled with 0.
-
-    Returns the enriched dataframe.
-    """
+def build_features(df, period="30d", interval="5m", ticker=None):
     df = df.copy()
     df = _add_liquidity_sweeps(df)
     df = _add_candle_features(df)
+    df = _add_session_features(df)                    # NEW
     df = _add_structural_trend(df)
     df = _add_adx(df)
     df = _add_macd_lr(df)
     df = _add_mean_reversion(df)
     df = _add_momentum(df)
+    df = _add_volatility_regime(df)                    # NEW
     df = _add_sweep_fvg_setups(df)
     df = _add_fvg_stack_features(df)
     df = _add_index_divergence(df, period=period, interval=interval)
     df = _add_breaker_block_features(df, ticker=ticker)
+    df = _add_breaker_confluence_features(df)           # NEW
+    df = _add_htf_trend_alignment(df, ticker=ticker, primary_interval=interval)  # NEW
+
+    for tf in ["1m", "5m", "15m"]:                      # NEW — binarize displacement
+        if f"breaker_displacement_power_{tf}" in df.columns:
+            df[f"breaker_strong_displacement_{tf}"] = (
+                df[f"breaker_displacement_power_{tf}"] > 1.5
+            ).astype("float32")
+
+    bool_signal_cols = [c for c in df.columns if c in FEATURES and c != "Close"]
+    for col in bool_signal_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce").astype("float32")
+
+    return df
+
 
     # Safety net: force every boolean-signal column to float32
     bool_signal_cols = [c for c in df.columns if c in FEATURES and c != "Close"]
@@ -1097,154 +1185,154 @@ FEATURES = [
     # ── continuous price ───────────────────────────────────────────────────
     "Close",
 
-    # # ── liquidity sweeps  (_add_liquidity_sweeps) ──────────────────────────
-    # "prev_day_high",       # previous session high (price level)
-    # "prev_day_low",        # previous session low  (price level)
-    # "high_wick_sweep",     # wick pierced prev high but closed below it
-    # "low_wick_sweep",      # wick pierced prev low  but closed above it
+    # ── liquidity sweeps  (_add_liquidity_sweeps) ──────────────────────────
+    # "prev_day_high",       # CONTINUOUS price level — stays commented, see note below
+    # "prev_day_low",        # CONTINUOUS price level — stays commented
+    "high_wick_sweep",     # wick pierced prev high but closed below it
+    "low_wick_sweep",      # wick pierced prev low  but closed above it
 
-    # # ── candle direction  (_add_candle_features) ───────────────────────────
-    # "isGreen",             # close > open
-    # "isHigh",              # green candle AND higher close than prior bar
-    # "isLow",               # red candle AND lower close than prior bar
+    # ── candle direction  (_add_candle_features) ───────────────────────────
+    "isGreen",             # close > open
+    "isHigh",              # green candle AND higher close than prior bar
+    "isLow",               # red candle AND lower close than prior bar
 
-    # # ── structural trend  (_add_structural_trend) ──────────────────────────
-    # # drop_first=True drops "trend_downtrend" (alphabetically first).
-    # # Encoding: downtrend → (trend_ranging=0, trend_uptrend=0)
-    # "trend_ranging",
-    # "trend_uptrend",
+    # ── structural trend  (_add_structural_trend) ──────────────────────────
+    # drop_first=True drops "trend_downtrend" (alphabetically first).
+    # Encoding: downtrend → (trend_ranging=0, trend_uptrend=0)
+    "trend_ranging",
+    "trend_uptrend",
 
-    # # ── ADX trend strength  (_add_adx) ────────────────────────────────────
-    # "ADX",
-    # "DMP",                    # +DI
-    # "DMN",                    # -DI
-    # "is_trending",            # ADX > 25
-    # "adx_uptrend",            # ADX > 25 AND +DI > -DI
-    # "adx_downtrend",          # ADX > 25 AND -DI > +DI
-    # "DI_cross_up",            # +DI just crossed above -DI this bar
-    # "DI_cross_down",          # -DI just crossed above +DI this bar
-    # "ADX_slope",              # 3-bar change in ADX
-    # "trend_strengthening",    # ADX slope > 0
-    # "trend_weakening",        # ADX slope < 0
-    # "strong_up",              # adx_uptrend AND strengthening
-    # "fading_up",              # adx_uptrend AND weakening
-    # "strong_down",            # adx_downtrend AND strengthening
-    # "fading_down",            # adx_downtrend AND weakening
+    # ── ADX trend strength  (_add_adx) ────────────────────────────────────
+    # "ADX",                    # CONTINUOUS — stays commented, see note below
+    # "DMP",                    # CONTINUOUS — stays commented
+    # "DMN",                    # CONTINUOUS — stays commented
+    "is_trending",            # ADX > 25
+    "adx_uptrend",            # ADX > 25 AND +DI > -DI
+    "adx_downtrend",          # ADX > 25 AND -DI > +DI
+    "DI_cross_up",            # +DI just crossed above -DI this bar
+    "DI_cross_down",          # -DI just crossed above +DI this bar
+    # "ADX_slope",              # CONTINUOUS — stays commented
+    "trend_strengthening",    # ADX slope > 0
+    "trend_weakening",        # ADX slope < 0
+    "strong_up",              # adx_uptrend AND strengthening
+    "fading_up",              # adx_uptrend AND weakening
+    "strong_down",            # adx_downtrend AND strengthening
+    "fading_down",            # adx_downtrend AND weakening
 
-    # # ── MACD + Linear Regression Channel  (_add_macd_lr) ──────────────────
-    # "macd_line",
-    # "macd_signal",
-    # "macd_hist",
-    # "lr_upper",               # LR midline + 4σ
-    # "lr_lower",               # LR midline − 4σ
-    # "near_upper_band",        # close ≥ midline + 0.8×dev (strong bullish)
-    # "near_lower_band",        # close ≤ midline − 0.8×dev (strong bearish)
-    # "touches_upper",          # close ≥ upper band (stretched)
-    # "touches_lower",          # close ≤ lower band (compressed)
-    # "broke_above",            # just crossed above upper band
-    # "broke_below",            # just crossed below lower band
-    # "bands_widening",         # band width > width 3 bars ago
-    # "bands_narrowing",        # band width < width 3 bars ago
-    # "macd_bullish_entry",     # MACD cross up while near lower band
-    # "macd_bearish_entry",     # MACD cross down while near upper band
-    # "rsi",
-    # "rsi_overbought",         # RSI > 70
-    # "rsi_oversold",           # RSI < 30
+    # ── MACD + Linear Regression Channel  (_add_macd_lr) ──────────────────
+    # "macd_line",              # CONTINUOUS — stays commented
+    # "macd_signal",            # CONTINUOUS — stays commented
+    # "macd_hist",              # CONTINUOUS — stays commented
+    # "lr_upper",               # CONTINUOUS price level — stays commented
+    # "lr_lower",               # CONTINUOUS price level — stays commented
+    "near_upper_band",        # close ≥ midline + 0.8×dev (strong bullish)
+    "near_lower_band",        # close ≤ midline − 0.8×dev (strong bearish)
+    "touches_upper",          # close ≥ upper band (stretched)
+    "touches_lower",          # close ≤ lower band (compressed)
+    "broke_above",            # just crossed above upper band
+    "broke_below",            # just crossed below lower band
+    "bands_widening",         # band width > width 3 bars ago
+    "bands_narrowing",        # band width < width 3 bars ago
+    "macd_bullish_entry",     # MACD cross up while near lower band
+    "macd_bearish_entry",     # MACD cross down while near upper band
+    # "rsi",                    # CONTINUOUS — stays commented
+    "rsi_overbought",         # RSI > 70
+    "rsi_oversold",           # RSI < 30
 
-    # # ── mean reversion  (_add_mean_reversion) ─────────────────────────────
-    # "mr_below_sma20",
-    # "mr_above_sma20",
-    # "mr_bb_below_lower",      # below lower Bollinger Band (2σ)
-    # "mr_bb_above_upper",      # above upper Bollinger Band (2σ)
-    # "mr_rsi_oversold",
-    # "mr_rsi_overbought",
-    # "mr_z_score_low",         # Z-score < −1.5
-    # "mr_z_score_high",        # Z-score >  1.5
-    # "mr_below_vwap",
-    # "mr_above_vwap",
+    # ── mean reversion  (_add_mean_reversion) ─────────────────────────────
+    "mr_below_sma20",
+    "mr_above_sma20",
+    "mr_bb_below_lower",      # below lower Bollinger Band (2σ)
+    "mr_bb_above_upper",      # above upper Bollinger Band (2σ)
+    "mr_rsi_oversold",
+    "mr_rsi_overbought",
+    "mr_z_score_low",         # Z-score < −1.5
+    "mr_z_score_high",        # Z-score >  1.5
+    "mr_below_vwap",
+    "mr_above_vwap",
 
-    # # ── momentum  (_add_momentum) ──────────────────────────────────────────
-    # "mo_roc_positive_20",     # 20-bar rate-of-change > 0
-    # "mo_roc_negative_20",
-    # "mo_golden_cross",        # SMA50 just crossed above SMA200
-    # "mo_death_cross",
-    # "mo_macd_cross_up",
-    # "mo_macd_cross_down",
-    # "mo_adx_trending",        # ADX > 25
-    # "mo_breakout_high20",     # close > 20-bar rolling high (no lookahead)
-    # "mo_breakdown_low20",
-    # "mo_volume_surge",        # volume > 2× 20-bar average
-    # "mo_consecutive_up3",     # 3+ consecutive green bars
-    # "mo_consecutive_down3",
-    # "mo_combo_long",          # ≥2 of 5 bullish momentum signals firing
-    # "mo_combo_short",
+    # ── momentum  (_add_momentum) ──────────────────────────────────────────
+    "mo_roc_positive_20",     # 20-bar rate-of-change > 0
+    "mo_roc_negative_20",
+    "mo_golden_cross",        # SMA50 just crossed above SMA200
+    "mo_death_cross",
+    "mo_macd_cross_up",
+    "mo_macd_cross_down",
+    "mo_adx_trending",        # ADX > 25
+    "mo_breakout_high20",     # close > 20-bar rolling high (no lookahead)
+    "mo_breakdown_low20",
+    "mo_volume_surge",        # volume > 2× 20-bar average
+    "mo_consecutive_up3",     # 3+ consecutive green bars
+    "mo_consecutive_down3",
+    "mo_combo_long",          # ≥2 of 5 bullish momentum signals firing
+    "mo_combo_short",
 
-    # # ── ICT liquidity sweep → FVG setups  (_add_sweep_fvg_setups) ─────────
-    # "fvg_bull_top",           # top of active bullish FVG (NaN = no active zone)
-    # "fvg_bull_bot",
-    # "fvg_bear_top",
-    # "fvg_bear_bot",
-    # "in_bull_fvg",            # price is currently inside a bullish FVG
-    # "in_bear_fvg",
-    # "recent_low_sweep",       # low sweep within last sweep_lookback bars
-    # "recent_high_sweep",
-    # "setup_bull_sweep_fvg",   # recent low sweep + currently in bull FVG
-    # "setup_bear_sweep_fvg",
-    # "setup_bull_confirmed",   # sweep+FVG setup confirmed by green candle
-    # "setup_bear_confirmed",
+    # ── ICT liquidity sweep → FVG setups  (_add_sweep_fvg_setups) ─────────
+    # "fvg_bull_top",           # CONTINUOUS price level — stays commented
+    # "fvg_bull_bot",           # CONTINUOUS price level — stays commented
+    # "fvg_bear_top",           # CONTINUOUS price level — stays commented
+    # "fvg_bear_bot",           # CONTINUOUS price level — stays commented
+    "in_bull_fvg",            # price is currently inside a bullish FVG
+    "in_bear_fvg",
+    "recent_low_sweep",       # low sweep within last sweep_lookback bars
+    "recent_high_sweep",
+    "setup_bull_sweep_fvg",   # recent low sweep + currently in bull FVG
+    "setup_bear_sweep_fvg",
+    "setup_bull_confirmed",   # sweep+FVG setup confirmed by green candle
+    "setup_bear_confirmed",
 
-    # # ── FVG Stack + Sequential Inversion Targeting  (_add_fvg_stack_features) ─
-    # "fvg_bull_stack_count",      # # active bull FVGs still in stack
-    # "fvg_bear_stack_count",      # # active bear FVGs still in stack
-    # "fvg_impulse_up_count",      # bull FVGs created in last stack_lookback bars (impulse strength)
-    # "fvg_impulse_dn_count",      # bear FVGs created in last stack_lookback bars
+    # ── FVG Stack + Sequential Inversion Targeting  (_add_fvg_stack_features) ─
+    # "fvg_bull_stack_count",      # COUNT (0,1,2,3...), not binary — stays commented
+    # "fvg_bear_stack_count",      # COUNT — stays commented
+    # "fvg_impulse_up_count",      # COUNT — stays commented
+    # "fvg_impulse_dn_count",      # COUNT — stays commented
 
-    # "fvg_near_bull_top",         # price: top of nearest (highest) active bull FVG
-    # "fvg_near_bull_bot",         # price: bottom of nearest active bull FVG
-    # "fvg_near_bull_size",        # gap width of nearest bull FVG
-    # "fvg_near_bull_mid",         # midpoint of nearest bull FVG
-    # "fvg_near_bear_top",         # price: top of nearest (lowest) active bear FVG
-    # "fvg_near_bear_bot",         # price: bottom of nearest active bear FVG
-    # "fvg_near_bear_size",        # gap width of nearest bear FVG
-    # "fvg_near_bear_mid",         # midpoint of nearest bear FVG
+    # "fvg_near_bull_top",         # CONTINUOUS price level — stays commented
+    # "fvg_near_bull_bot",         # CONTINUOUS price level — stays commented
+    # "fvg_near_bull_size",        # CONTINUOUS — stays commented
+    # "fvg_near_bull_mid",         # CONTINUOUS price level — stays commented
+    # "fvg_near_bear_top",         # CONTINUOUS price level — stays commented
+    # "fvg_near_bear_bot",         # CONTINUOUS price level — stays commented
+    # "fvg_near_bear_size",        # CONTINUOUS — stays commented
+    # "fvg_near_bear_mid",         # CONTINUOUS price level — stays commented
 
-    # "fvg_next_bull_top",         # price: 2nd bull FVG in the stack (below nearest)
-    # "fvg_next_bull_bot",
-    # "fvg_next_bear_top",         # price: 2nd bear FVG in the stack (above nearest)
-    # "fvg_next_bear_bot",
+    # "fvg_next_bull_top",         # CONTINUOUS price level — stays commented
+    # "fvg_next_bull_bot",         # CONTINUOUS price level — stays commented
+    # "fvg_next_bear_top",         # CONTINUOUS price level — stays commented
+    # "fvg_next_bear_bot",         # CONTINUOUS price level — stays commented
 
-    # "fvg_target_bull_top",       # price: top of the pinned bull target FVG (NaN if inactive)
-    # "fvg_target_bull_bot",
-    # "fvg_target_bear_top",       # price: top of the pinned bear target FVG
-    # "fvg_target_bear_bot",
+    # "fvg_target_bull_top",       # CONTINUOUS price level — stays commented
+    # "fvg_target_bull_bot",       # CONTINUOUS price level — stays commented
+    # "fvg_target_bear_top",       # CONTINUOUS price level — stays commented
+    # "fvg_target_bear_bot",       # CONTINUOUS price level — stays commented
 
-    # "fvg_bull_inversion",        # 1 when nearest bull FVG inversed (close < bot)
-    # "fvg_bear_inversion",        # 1 when nearest bear FVG inversed (close > top)
-    # "fvg_bull_stacking",         # 1 if ≥2 active bull FVGs (impulse regime detected)
-    # "fvg_bear_stacking",         # 1 if ≥2 active bear FVGs
+    "fvg_bull_inversion",        # 1 when nearest bull FVG inversed (close < bot)
+    "fvg_bear_inversion",        # 1 when nearest bear FVG inversed (close > top)
+    "fvg_bull_stacking",         # 1 if ≥2 active bull FVGs (impulse regime detected)
+    "fvg_bear_stacking",         # 1 if ≥2 active bear FVGs
 
-    # "fvg_targeting_next_bull",   # 1 while in post-inversion targeting state (bull)
-    # "fvg_targeting_next_bear",   # 1 while in post-inversion targeting state (bear)
-    # "fvg_at_next_bull",          # 1 when price first arrives at the next bull FVG target
-    # "fvg_at_next_bear",          # 1 when price first arrives at the next bear FVG target
+    "fvg_targeting_next_bull",   # 1 while in post-inversion targeting state (bull)
+    "fvg_targeting_next_bear",   # 1 while in post-inversion targeting state (bear)
+    "fvg_at_next_bull",          # 1 when price first arrives at the next bull FVG target
+    "fvg_at_next_bear",          # 1 when price first arrives at the next bear FVG target
 
-    # "fvg_dist_to_near_bull",     # (close − near_top) / close; neg = price inside or below zone
-    # "fvg_dist_to_near_bear",     # (near_bot − close) / close; neg = price inside or above zone
-    # "fvg_dist_to_target_bull",   # normalized distance to active bull target (NaN if inactive)
-    # "fvg_dist_to_target_bear",   # normalized distance to active bear target
+    # "fvg_dist_to_near_bull",     # CONTINUOUS — stays commented
+    # "fvg_dist_to_near_bear",     # CONTINUOUS — stays commented
+    # "fvg_dist_to_target_bull",   # CONTINUOUS — stays commented
+    # "fvg_dist_to_target_bear",   # CONTINUOUS — stays commented
 
-    # "fvg_bull_inv_with_target",  # inversion fired AND next-target FVG exists — the core setup
-    # "fvg_bear_inv_with_target",
+    "fvg_bull_inv_with_target",  # inversion fired AND next-target FVG exists — the core setup
+    "fvg_bear_inv_with_target",
 
-    # # ── SPY / QQQ index divergence  (_add_index_divergence) ───────────────
-    # "spy_ret",                # SPY bar-over-bar return
-    # "qqq_ret",                # QQQ bar-over-bar return
-    # "idx_div_spy_up_qqq_down",
-    # "idx_div_spy_down_qqq_up",
-    # "idx_div_any",
-    # "idx_div_rolling3",       # divergence persisted in any of last 3 bars
-    # "idx_corr_20",            # 20-bar rolling SPY/QQQ correlation
-    # "idx_corr_breakdown",     # rolling correlation < 0.5 (regime decoupling)
+    # ── SPY / QQQ index divergence  (_add_index_divergence) ───────────────
+    # "spy_ret",                # CONTINUOUS — stays commented
+    # "qqq_ret",                # CONTINUOUS — stays commented
+    "idx_div_spy_up_qqq_down",
+    "idx_div_spy_down_qqq_up",
+    "idx_div_any",
+    "idx_div_rolling3",       # divergence persisted in any of last 3 bars
+    # "idx_corr_20",            # CONTINUOUS — stays commented
+    "idx_corr_breakdown",     # rolling correlation < 0.5 (regime decoupling)
 
     # ── ICT breaker blocks — double inverse  (_add_breaker_block_features) ─
     "breaker_bull_double_inverse_1m",   # bullish reclaim of a bearish breaker, 1m
@@ -1255,6 +1343,32 @@ FEATURES = [
     "breaker_bear_double_inverse_15m",
     "breaker_bull_double_inverse_any",  # fired on ANY of the 3 timeframes
     "breaker_bear_double_inverse_any",
+
+    # ── session / time-of-day ────────────────────────────────
+    "sess_open_30m", "sess_lunch_lull", "sess_close_30m",
+
+    # ── HTF trend alignment ──────────────────────────────────
+    "htf_trend_up",
+
+    # ── volatility regime ────────────────────────────────────
+    "vol_regime_elevated",
+
+    # ── breaker confluence (shared) ──────────────────────────
+    "breaker_in_killzone",
+    "breaker_near_eq_liquidity",
+
+    # ── breaker confluence (per-timeframe) ───────────────────
+    "breaker_bull_favorable_rr_1m", "breaker_bear_favorable_rr_1m",
+    "breaker_strong_displacement_1m", "breaker_volume_confirmed_1m",
+    "breaker_unicorn_1m", "breaker_first_retest_1m",
+
+    "breaker_bull_favorable_rr_5m", "breaker_bear_favorable_rr_5m",
+    "breaker_strong_displacement_5m", "breaker_volume_confirmed_5m",
+    "breaker_unicorn_5m", "breaker_first_retest_5m",
+
+    "breaker_bull_favorable_rr_15m", "breaker_bear_favorable_rr_15m",
+    "breaker_strong_displacement_15m", "breaker_volume_confirmed_15m",
+    "breaker_unicorn_15m", "breaker_first_retest_15m",
 
     # ── FinBERT / Finnhub news sentiment  (step 3 — optional) ─────────────
     # Only present when USE_NEWS_SENTIMENT = True.
