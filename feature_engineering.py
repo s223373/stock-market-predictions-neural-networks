@@ -862,26 +862,73 @@ def _detect_breaker_double_inverse(o, h, l, c, v, structure_lookback=20, min_rr=
     bear_double_inverse = np.zeros(n)
     bull_target_price = np.full(n, np.nan)
     bear_target_price = np.full(n, np.nan)
-    bull_zone_edge = np.full(n, np.nan)   # NEW — ob["bot"], the bull breaker's stop level
-    bear_zone_edge = np.full(n, np.nan)   # NEW — ob["top"], the bear breaker's stop level
+    bull_zone_edge = np.full(n, np.nan)
+    bear_zone_edge = np.full(n, np.nan)
     bull_favorable_rr = np.zeros(n)
     bear_favorable_rr = np.zeros(n)
     displacement_power = np.zeros(n)
-    volume_confirmed    = np.zeros(n)
-    unicorn              = np.zeros(n)
-    first_retest          = np.zeros(n)
+    volume_confirmed = np.zeros(n)
+    unicorn = np.zeros(n)
+    first_retest = np.zeros(n)
+
+    bull_obs: list = []
+    bear_obs: list = []
 
     if n < structure_lookback + 2:
         return (bull_double_inverse, bear_double_inverse,
                 bull_target_price, bear_target_price,
-                bull_zone_edge, bear_zone_edge,             # NEW
+                bull_zone_edge, bear_zone_edge,
                 bull_favorable_rr, bear_favorable_rr,
                 displacement_power, volume_confirmed, unicorn, first_retest)
 
-    # ... (prior_high, prior_low, avg_range, avg_vol unchanged) ...
+    prior_high = pd.Series(h).shift(1).rolling(structure_lookback, min_periods=1).max().values
+    prior_low  = pd.Series(l).shift(1).rolling(structure_lookback, min_periods=1).min().values
+    avg_range = pd.Series(h - l).shift(1).rolling(10, min_periods=1).mean().values
+    avg_vol   = pd.Series(v).shift(1).rolling(20, min_periods=1).mean().values
 
     for i in range(n):
-        # ... (FVG check, OB creation blocks unchanged) ...
+        fvg_bull_top = fvg_bull_bot = fvg_bear_top = fvg_bear_bot = None
+        if i >= 2:
+            if l[i] > h[i - 2]:
+                fvg_bull_bot, fvg_bull_top = h[i - 2], l[i]
+            if h[i] < l[i - 2]:
+                fvg_bear_bot, fvg_bear_top = h[i], l[i - 2]
+
+        if not np.isnan(prior_high[i]) and c[i] > prior_high[i]:
+            j = i - 1
+            while j >= 0 and c[j] >= o[j]:
+                j -= 1
+            if j >= 0:
+                ob_top, ob_bot = max(o[j], c[j]), min(o[j], c[j])
+                disp_power = (h[i] - l[i]) / avg_range[i] if avg_range[i] and not np.isnan(avg_range[i]) else 0.0
+                vol_conf = float(v[i] > 1.5 * avg_vol[i]) if avg_vol[i] and not np.isnan(avg_vol[i]) else 0.0
+                uni = 0.0
+                if fvg_bull_top is not None:
+                    uni = float(fvg_bull_bot <= ob_top and fvg_bull_top >= ob_bot)
+                bull_obs.append({
+                    "top": ob_top, "bot": ob_bot, "created": j, "state": "ob",
+                    "impulse_extreme": prior_high[i],
+                    "disp_power": disp_power, "vol_conf": vol_conf, "unicorn": uni,
+                    "touches": 0,
+                })
+
+        if not np.isnan(prior_low[i]) and c[i] < prior_low[i]:
+            j = i - 1
+            while j >= 0 and c[j] <= o[j]:
+                j -= 1
+            if j >= 0:
+                ob_top, ob_bot = max(o[j], c[j]), min(o[j], c[j])
+                disp_power = (h[i] - l[i]) / avg_range[i] if avg_range[i] and not np.isnan(avg_range[i]) else 0.0
+                vol_conf = float(v[i] > 1.5 * avg_vol[i]) if avg_vol[i] and not np.isnan(avg_vol[i]) else 0.0
+                uni = 0.0
+                if fvg_bear_top is not None:
+                    uni = float(fvg_bear_bot <= ob_top and fvg_bear_top >= ob_bot)
+                bear_obs.append({
+                    "top": ob_top, "bot": ob_bot, "created": j, "state": "ob",
+                    "impulse_extreme": prior_low[i],
+                    "disp_power": disp_power, "vol_conf": vol_conf, "unicorn": uni,
+                    "touches": 0,
+                })
 
         still_bull = []
         for ob in bull_obs:
@@ -894,19 +941,19 @@ def _detect_breaker_double_inverse(o, h, l, c, v, structure_lookback=20, min_rr=
                         ob["touches"] += 1
                     if c[i] > ob["top"]:
                         bull_double_inverse[i] = 1.0
-                        displacement       = ob["impulse_extreme"] - ob["bot"]
-                        tgt                 = ob["top"] + displacement
+                        displacement = ob["impulse_extreme"] - ob["bot"]
+                        tgt = ob["top"] + displacement
                         bull_target_price[i] = tgt
-                        bull_zone_edge[i]    = ob["bot"]      # NEW — natural stop level
+                        bull_zone_edge[i] = ob["bot"]
 
                         reward = tgt - c[i]
-                        risk   = c[i] - ob["bot"]
+                        risk = c[i] - ob["bot"]
                         bull_favorable_rr[i] = float(risk > 0 and (reward / risk) >= min_rr)
 
                         displacement_power[i] = ob["disp_power"]
-                        volume_confirmed[i]   = ob["vol_conf"]
-                        unicorn[i]            = ob["unicorn"]
-                        first_retest[i]       = float(ob["touches"] <= 1)
+                        volume_confirmed[i] = ob["vol_conf"]
+                        unicorn[i] = ob["unicorn"]
+                        first_retest[i] = float(ob["touches"] <= 1)
                         consumed = True
             if not consumed:
                 still_bull.append(ob)
@@ -923,19 +970,19 @@ def _detect_breaker_double_inverse(o, h, l, c, v, structure_lookback=20, min_rr=
                         ob["touches"] += 1
                     if c[i] < ob["bot"]:
                         bear_double_inverse[i] = 1.0
-                        displacement       = ob["bot"] - ob["impulse_extreme"]
-                        tgt                 = ob["bot"] - displacement
+                        displacement = ob["bot"] - ob["impulse_extreme"]
+                        tgt = ob["bot"] - displacement
                         bear_target_price[i] = tgt
-                        bear_zone_edge[i]    = ob["top"]      # NEW — natural stop level
+                        bear_zone_edge[i] = ob["top"]
 
                         reward = c[i] - tgt
-                        risk   = ob["top"] - c[i]
+                        risk = ob["top"] - c[i]
                         bear_favorable_rr[i] = float(risk > 0 and (reward / risk) >= min_rr)
 
                         displacement_power[i] = ob["disp_power"]
-                        volume_confirmed[i]   = ob["vol_conf"]
-                        unicorn[i]            = ob["unicorn"]
-                        first_retest[i]       = float(ob["touches"] <= 1)
+                        volume_confirmed[i] = ob["vol_conf"]
+                        unicorn[i] = ob["unicorn"]
+                        first_retest[i] = float(ob["touches"] <= 1)
                         consumed = True
             if not consumed:
                 still_bear.append(ob)
@@ -943,7 +990,7 @@ def _detect_breaker_double_inverse(o, h, l, c, v, structure_lookback=20, min_rr=
 
     return (bull_double_inverse, bear_double_inverse,
             bull_target_price, bear_target_price,
-            bull_zone_edge, bear_zone_edge,                 # NEW
+            bull_zone_edge, bear_zone_edge,
             bull_favorable_rr, bear_favorable_rr,
             displacement_power, volume_confirmed, unicorn, first_retest)
 

@@ -21,6 +21,7 @@ def backtest():
                                interval=PRIMARY_TF, ticker=TICKER)
 
     pdf = enriched.loc[enriched.index.intersection(primary_test_idx)]
+    assert len(pdf) == len(combined), f"{len(pdf)} vs {len(combined)}"
     close = pdf["Close"].values
     high  = pdf["High"].values
     low   = pdf["Low"].values
@@ -78,6 +79,12 @@ def backtest():
     trades = np.array(trades)
     wins = trades[trades > 0]
     losses = trades[trades < 0]
+    print("bull_tp non-nan:", np.sum(~np.isnan(bull_tp)))
+    print("bull_edge non-nan:", np.sum(~np.isnan(bull_edge)))
+    print("bear_tp non-nan:", np.sum(~np.isnan(bear_tp)))
+    print("bear_edge non-nan:", np.sum(~np.isnan(bear_edge)))
+    print("BUY signals:", np.sum(combined == BUY))
+    print("SELL signals:", np.sum(combined == SELL))
     print(f"Trades          : {len(trades)}")
     print(f"Win rate        : {(trades > 0).mean():.2%}" if len(trades) else "n/a")
     print(f"Avg win         : {wins.mean():.4%}" if len(wins) else "Avg win: n/a")
