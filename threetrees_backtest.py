@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 from feature_engineering import build_features
-from three_trees import build_model, TICKER, TIMEFRAME_PERIODS, PRIMARY_TF, BUY, SELL, HOLD
+from three_trees import build_model, TICKER, TIMEFRAME_PERIODS, PRIMARY_TF, BUY, SELL, HOLD, plot_tree_feature_importances
 
 MAX_HOLD_BARS = 200      # was 50 — give the target more time to actually get hit
 # STOP_LOSS_PCT = 0.0015
@@ -11,6 +11,7 @@ TARGET_PULLBACK = 0.1   # shrink target distance by this fraction (toward entry)
 
 def backtest():
     grids, preds, tests, combined = build_model()
+    plot_tree_feature_importances(grids)
     primary_test_idx = tests[PRIMARY_TF].index
 
     raw = yf.download(TICKER, period=TIMEFRAME_PERIODS[PRIMARY_TF],

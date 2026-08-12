@@ -445,14 +445,15 @@ def build_labeled_dataset(
     enriched["target"] = label_signals(enriched)
 
     # ── [5] Finalise ──────────────────────────────────────────────────────────
-    print("[5/5] Selecting Close + boolean features, cleaning and finalising …")
+    print("[5/5] Selecting Close + features, cleaning and finalising …")
 
     # Candidate columns come entirely from feat_cols, which is derived from
     # feature_engineering.FEATURES (+ news cols) — no separate hand-kept list.
-    # Among those, keep the ones whose actual values are binary (0/1).
+    # Previously narrowed further to _is_binary_col(...) only — that filter
+    # is now removed, so continuous columns uncommented in FEATURES (ADX,
+    # lorentzian_prediction, lorentzian_bars_since_signal, etc.) survive too.
     candidates = [c for c in feat_cols if c != "Close" and c in enriched.columns]
-    bool_cols  = [c for c in candidates if _is_binary_col(enriched[c])]
-    keep       = list(dict.fromkeys(["Close"] + bool_cols + ["target"]))
+    keep       = list(dict.fromkeys(["Close"] + candidates + ["target"]))
     dataset    = enriched[keep].copy()
 
     # Drop unlabelable tail rows (target NaN for last FORWARD_BARS bars)
@@ -461,10 +462,8 @@ def build_labeled_dataset(
     n_after  = len(dataset)
     print(f"  Dropped {n_before - n_after:,} tail rows. {n_after:,} rows remain.")
 
-    # NaN handling for boolean feature columns
-    # (FVG zone cols not present here since those are continuous price levels,
-    #  not boolean, but _clean_features handles them safely via intersection checks)
-    dataset = _clean_features(dataset, bool_cols)
+    # NaN handling for feature columns
+    dataset = _clean_features(dataset, candidates)
 
     # Safe to cast now that all NaN rows are gone
     dataset["target"] = dataset["target"].astype(int)
@@ -486,7 +485,7 @@ def build_labeled_dataset(
     elif LABEL_METHOD == "rolling_std": print(f"  ({STD_MULT}× 20-bar σ)")
     print(f"  Forward bars    : {FORWARD_BARS} (≈ {FORWARD_BARS * bar_num} {bar_unit})")
     print(f"  Continuous cols : 1  (Close)")
-    print(f"  Boolean cols    : {len(bool_cols)}  (auto-detected from FEATURES)")
+    print(f"  Feature cols    : {len(candidates)}  (auto-detected from FEATURES)")
     print(f"  News sentiment  : {'✓ included' if news_bool_present else '✗ skipped'}")
     print(f"  Total rows      : {total:,}")
     print(f"\n  Class distribution:")

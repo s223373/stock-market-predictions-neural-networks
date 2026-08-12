@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 from scipy.stats import randint, uniform
 
 from sklearn.calibration    import CalibratedClassifierCV
@@ -10,6 +11,7 @@ from sklearn.pipeline       import Pipeline
 from sklearn.tree           import DecisionTreeClassifier
 
 from dataset_builder import build_labeled_dataset
+from force_features import ForcedRootTree
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -19,7 +21,7 @@ from dataset_builder import build_labeled_dataset
 # Data
 TICKER          = "SPY"
 PERIOD          = "60d"
-INTERVAL        = "5m"
+INTERVAL        = "1m"
 
 # The three timeframes for building fully independent, per-timeframe
 # dataframes (see build_multi_timeframe_datasets below).
@@ -86,6 +88,24 @@ SHARED_FEATURES = [
     "fvg_bull_inv_with_target", "fvg_bear_inv_with_target",
     "idx_div_spy_up_qqq_down", "idx_div_spy_down_qqq_up",
     "idx_div_any", "idx_div_rolling3", "idx_corr_breakdown",
+
+    # ── session / time-of-day (new) ──────────────────────────
+    "sess_open_30m", "sess_lunch_lull", "sess_close_30m",
+
+    # ── higher-timeframe trend alignment (new) ───────────────
+    "htf_trend_up",
+
+    # ── volatility regime (new) ───────────────────────────────
+    "vol_regime_elevated",
+
+    # ── breaker confluence, shared across all 3 trees (new) ──
+    "breaker_in_killzone",
+    "breaker_near_eq_liquidity",
+
+    "lorentzian_signal_long", 
+    "lorentzian_signal_short",
+    "lorentzian_bars_since_signal",
+    "lorentzian_prediction",
 ]
 
 # Which 2 breaker columns belong to which timeframe's tree, kept separate
@@ -94,15 +114,26 @@ SHARED_FEATURES = [
 # would leak other-timeframe information into what's supposed to be an
 # isolated, timeframe-specific signal.
 TIMEFRAME_BREAKER_PAIR = {
-    "1m":  ["breaker_bull_double_inverse_1m",  "breaker_bear_double_inverse_1m"],
-    "5m":  ["breaker_bull_double_inverse_5m",  "breaker_bear_double_inverse_5m"],
-    "15m": ["breaker_bull_double_inverse_15m", "breaker_bear_double_inverse_15m"],
+    "1m":  ["breaker_bull_double_inverse_1m",  "breaker_bear_double_inverse_1m",
+            "breaker_bull_favorable_rr_1m", "breaker_bear_favorable_rr_1m",
+            "breaker_strong_displacement_1m", "breaker_volume_confirmed_1m",
+            "breaker_unicorn_1m", "breaker_first_retest_1m"],
+    "5m":  ["breaker_bull_double_inverse_5m",  "breaker_bear_double_inverse_5m",
+            "breaker_bull_favorable_rr_5m", "breaker_bear_favorable_rr_5m",
+            "breaker_strong_displacement_5m", "breaker_volume_confirmed_5m",
+            "breaker_unicorn_5m", "breaker_first_retest_5m"],
+    "15m": ["breaker_bull_double_inverse_15m", "breaker_bear_double_inverse_15m",
+            "breaker_bull_favorable_rr_15m", "breaker_bear_favorable_rr_15m",
+            "breaker_strong_displacement_15m", "breaker_volume_confirmed_15m",
+            "breaker_unicorn_15m", "breaker_first_retest_15m"],
 }
 
 TIMEFRAME_FEATURES = {
     tf: SHARED_FEATURES + pair
     for tf, pair in TIMEFRAME_BREAKER_PAIR.items()
 }
+
+FORCE_COLS = ["_breaker_active", "_lorentzian_active"]
 
 # Split fractions (must sum to 1.0); all chronological — no shuffling
 TRAIN_FRAC      = 0.70   # oldest 70 % → hyperparameter tuning
@@ -125,7 +156,7 @@ PARAM_DIST = {
     "max_depth"        : [7],
     "min_samples_leaf" : [1, 5, 10, 20],
     "min_samples_split": [2, 10, 20],
-    "max_features"     : ["sqrt", "log2", None],
+    "max_features"     : [None],
 }
 
 # Feature pruning — not used by this file's per-timeframe trees (each tree
@@ -193,15 +224,6 @@ def build_multi_timeframe_datasets(ticker=TICKER, intervals=INTERVALS):
 
 
 def load_and_prepare(df, interval=INTERVAL):
-    """
-    Narrow one per-timeframe labeled dataframe (from
-    build_multi_timeframe_datasets) down to just that timeframe's own 2
-    breaker columns as X, plus target as y.
-
-    Uses an explicit allowlist (TIMEFRAME_FEATURES[interval]) rather than
-    computing a "drop everything else" list — simpler to read and nothing
-    can silently slip through if a column name changes upstream.
-    """
     print(f"── Loading dataset ({interval}) ──────────────────────────")
 
     requested = TIMEFRAME_FEATURES.get(interval, [])
@@ -210,9 +232,6 @@ def load_and_prepare(df, interval=INTERVAL):
 
     if missing:
         print(f"  ⚠  {len(missing)} requested column(s) not found and skipped: {missing}")
-        print(f"     (continuous indicators like ADX/rsi/macd_line/price levels never "
-              f"survive dataset_builder.py's boolean-only filter — only list boolean "
-              f"FEATURES entries in SHARED_FEATURES.)")
     if not features:
         raise ValueError(
             f"No columns found for interval='{interval}'. Expected "
@@ -221,6 +240,21 @@ def load_and_prepare(df, interval=INTERVAL):
 
     X = df[features].copy()
     y = df["target"]
+
+    # Combined force-flags — only build if the underlying columns survived
+    # into this timeframe's dataset. Guard against KeyError rather than
+    # assuming they're always present.
+    bull_col, bear_col = TIMEFRAME_BREAKER_PAIR[interval][0], TIMEFRAME_BREAKER_PAIR[interval][1]
+    if bull_col in X.columns and bear_col in X.columns:
+        X["_breaker_active"] = ((X[bull_col] > 0) | (X[bear_col] > 0)).astype(int)
+    else:
+        print(f"  ⚠  Skipping _breaker_active — {bull_col}/{bear_col} not in X for '{interval}'.")
+
+    if "lorentzian_signal_long" in X.columns and "lorentzian_signal_short" in X.columns:
+        X["_lorentzian_active"] = ((X["lorentzian_signal_long"] > 0) | (X["lorentzian_signal_short"] > 0)).astype(int)
+    else:
+        print(f"  ⚠  Skipping _lorentzian_active — lorentzian_signal_long/short not in X for '{interval}'.")
+        print(f"     df.columns sample: {[c for c in df.columns if 'lorentzian' in c]}")
 
     print(f"   Feature matrix : {X.shape[0]:,} rows × {X.shape[1]} cols")
     print(f"   Features used  : {list(X.columns)}")
@@ -363,6 +397,33 @@ def combine_signals(pred_1m: np.ndarray, pred_5m: np.ndarray, pred_15m: np.ndarr
     signal[sell_count > buy_count]  = SELL
     return signal
 
+def plot_tree_feature_importances(grids, output_path="tree_feature_importances.png"):
+    """
+    One horizontal bar-chart subplot per timeframe tree, showing each
+    tree's feature_importances_ sorted descending. Reads straight off
+    grids[tf].best_estimator_ — no retraining needed.
+    """
+    tfs = list(grids.keys())
+    fig, axes = plt.subplots(1, len(tfs), figsize=(6 * len(tfs), 8))
+    if len(tfs) == 1:
+        axes = [axes]
+
+    for ax, tf in zip(axes, tfs):
+        tree = grids[tf].best_estimator_
+        importances = pd.Series(tree.feature_importances_, index=tree.feature_names_in_)
+        importances = importances[importances > 0].sort_values(ascending=True)
+
+        ax.barh(importances.index, importances.values, color="#009988")
+        ax.set_title(f"{tf} tree — feature importances")
+        ax.set_xlabel("Importance")
+        ax.tick_params(axis="y", labelsize=7)
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"\n✓  Saved feature importance chart → {output_path}")
+    return output_path
+
 
 def build_model(ticker=TICKER, period=PERIOD, intervals=INTERVALS):
     """
@@ -398,13 +459,13 @@ def build_model(ticker=TICKER, period=PERIOD, intervals=INTERVALS):
         X_train, X_cal, X_test, y_train, y_cal, y_test = chronological_split(X, y)
         X_train, y_train = undersample_hold(X_train, y_train)
 
-        tree = DecisionTreeClassifier(random_state=RANDOM_STATE, class_weight="balanced")
+        tree = ForcedRootTree(force_cols=FORCE_COLS, random_state=RANDOM_STATE)
         grid = GridSearchCV(
-            estimator  = tree,
-            param_grid = PARAM_DIST,
-            cv         = TimeSeriesSplit(n_splits=CV_SPLITS),
-            scoring    = "f1_macro",
-            n_jobs     = -1,
+            estimator=tree,
+            param_grid=PARAM_DIST,
+            cv=TimeSeriesSplit(n_splits=CV_SPLITS),
+            scoring="f1_macro",
+            n_jobs=-1,
         )
         grid.fit(X_train, y_train)
 
