@@ -1151,6 +1151,16 @@ def _add_htf_trend_alignment(df, ticker, primary_interval, htf_interval="15m", h
         df["htf_trend_up"] = 0.0
     return df
 
+def _compute_atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
+    """Exponential ATR (Wilder-style EMA on True Range)."""
+    prev_close = df["Close"].shift(1)
+    tr = pd.concat([
+        df["High"] - df["Low"],
+        (df["High"] - prev_close).abs(),
+        (df["Low"]  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(span=window, adjust=False).mean()
+
 def _add_volatility_regime(df, lookback=100):
     atr = _compute_atr(df) if "_compute_atr" in globals() else None
     if atr is None:
@@ -1162,6 +1172,323 @@ def _add_volatility_regime(df, lookback=100):
     atr_pct = atr / df["Close"]
     atr_median = atr_pct.rolling(lookback, min_periods=20).median()
     df["vol_regime_elevated"] = (atr_pct > atr_median).astype(float)
+    return df
+
+def _add_lorentzian_classification(
+    df,
+    neighbors_count=8,
+    max_bars_back=2000,
+    feature_lookback=200,
+):
+    """
+    Lorentzian Classification (jdehorty) ported to Python.
+
+    Approximate k-NN over 5 normalized features (RSI-14, WT-proxy, CCI-20,
+    ADX-20, RSI-9), using Lorentzian distance log(1+|a-b|) instead of
+    Euclidean. Distance is more robust to outliers than Euclidean — like
+    measuring on a compressed ruler instead of a flat one, so a single
+    price shock doesn't warp the whole neighborhood.
+
+    Label per historical bar: did close 4 bars later end up higher (+1),
+    lower (-1), or flat (0) than today?
+
+    Columns added
+    -------------
+    lorentzian_prediction   raw vote sum in [-neighbors_count, +neighbors_count]
+    lorentzian_signal_long  prediction > 0
+    lorentzian_signal_short prediction < 0
+    """
+    close, high, low = df["Close"].values, df["High"].values, df["Low"].values
+    n = len(close)
+
+    # ── Feature 1: RSI-14 (0-100) ───────────────────────────────────────────
+    delta = pd.Series(close).diff()
+    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+    rsi14 = (100 - 100 / (1 + gain / (loss + 1e-9))).values
+
+    # ── Feature 2: WT proxy (Williams %R-style, 0-100) ─────────────────────
+    hl_range = pd.Series(high).rolling(10).max() - pd.Series(low).rolling(10).min()
+    wt = (100 * (pd.Series(close) - pd.Series(low).rolling(10).min()) /
+          (hl_range + 1e-9)).values
+
+    # ── Feature 3: CCI-20 (unbounded, rescaled to ~0-100) ──────────────────
+    tp = (pd.Series(high) + pd.Series(low) + pd.Series(close)) / 3
+    cci_raw = ta.trend.CCIIndicator(pd.Series(high), pd.Series(low),
+                                     pd.Series(close), window=20).cci()
+    cci = (50 + cci_raw.clip(-200, 200) / 4).values  # squash into ~0-100
+
+    # ── Feature 4: ADX-20 (0-100, already bounded) ─────────────────────────
+    adx = ta.trend.ADXIndicator(pd.Series(high), pd.Series(low),
+                                 pd.Series(close), window=20).adx().values
+
+    # ── Feature 5: RSI-9 ────────────────────────────────────────────────────
+    gain9 = delta.clip(lower=0).ewm(alpha=1/9, adjust=False).mean()
+    loss9 = (-delta.clip(upper=0)).ewm(alpha=1/9, adjust=False).mean()
+    rsi9 = (100 - 100 / (1 + gain9 / (loss9 + 1e-9))).values
+
+    raw_feats = [rsi14, wt, cci, adx, rsi9]
+
+    # ── Normalize each feature to [0,1] via rolling min-max ────────────────
+    feats = []
+    for f in raw_feats:
+        s = pd.Series(f)
+        roll_min = s.rolling(feature_lookback, min_periods=1).min()
+        roll_max = s.rolling(feature_lookback, min_periods=1).max()
+        feats.append(((s - roll_min) / (roll_max - roll_min + 1e-9)).values)
+
+    # ── Training labels: direction 4 bars forward ──────────────────────────
+    y_train = np.zeros(n)
+    y_train[:-4] = np.where(close[4:] > close[:-4], 1,
+                    np.where(close[4:] < close[:-4], -1, 0))
+
+    prediction = np.zeros(n)
+    max_bars_back_index = max(0, n - max_bars_back)
+
+    for bar in range(max_bars_back_index, n):
+        last_distance = -1.0
+        distances, predictions = [], []
+        size = min(max_bars_back - 1, bar - 1)
+        if size < 1:
+            continue
+
+        for i in range(size + 1):
+            if i % 4 == 0:
+                continue
+            d = 0.0
+            for f in feats:
+                d += np.log1p(abs(f[bar] - f[i]))
+            if d >= last_distance:
+                last_distance = d
+                distances.append(d)
+                predictions.append(y_train[i])
+                if len(predictions) > neighbors_count:
+                    last_distance = distances[round(neighbors_count * 3 / 4)]
+                    distances.pop(0)
+                    predictions.pop(0)
+
+        prediction[bar] = sum(predictions)
+
+    # ── Carry the last non-neutral signal forward (matches Pine's
+    #    `signal := prediction>0 ? long : prediction<0 ? short : nz(signal[1])`)
+    #    A bar with prediction==0 is NOT "no signal" — it means the vote was
+    #    tied/absent, so the model should still report whatever the last
+    #    real (nonzero) prediction was, not silently reset to neutral. ─────
+    raw_signal = np.where(prediction > 0, 1, np.where(prediction < 0, -1, 0))
+    carried_signal = pd.Series(raw_signal).replace(0, np.nan).ffill().fillna(0).values
+
+    # ── How stale is the carried signal? Lets the tree learn that a
+    #    signal from 2 bars ago carries more weight than one held from
+    #    50 bars ago. ───────────────────────────────────────────────────
+    raw_nonzero_mask = raw_signal != 0
+    bars_since = np.zeros(n)
+    last_fire = -1
+    for i in range(n):
+        if raw_nonzero_mask[i]:
+            last_fire = i
+        bars_since[i] = (i - last_fire) if last_fire >= 0 else np.nan
+
+    df["lorentzian_prediction"] = prediction.astype("float32")
+    df["lorentzian_signal_long"] = (carried_signal > 0).astype("float32")
+    df["lorentzian_signal_short"] = (carried_signal < 0).astype("float32")
+    df["lorentzian_bars_since_signal"] = bars_since.astype("float32")
+    return df
+
+def _add_nadaraya_watson_envelope(df, bandwidth=8.0, mult=3.0, src_col="Close", hold_bars=10):
+    """
+    Nadaraya-Watson Envelope (LuxAlgo), non-repainting endpoint method,
+    with buy/sell triggers that stay "active" for `hold_bars` bars after firing.
+
+    Columns added
+    -------------
+    nwe_mid, nwe_upper, nwe_lower       kernel regression + bands
+    nwe_touches_upper, nwe_touches_lower
+    nwe_cross_under_lower   raw one-bar trigger (Pine's ▲, buy)
+    nwe_cross_over_upper    raw one-bar trigger (Pine's ▼, sell)
+    nwe_buy_signal          1 for hold_bars bars after a buy trigger fires
+    nwe_sell_signal         1 for hold_bars bars after a sell trigger fires
+    nwe_bars_since_buy      bars since the last buy trigger (NaN if none yet)
+    nwe_bars_since_sell     bars since the last sell trigger (NaN if none yet)
+    """
+    src = df[src_col].astype(float)
+    n = len(src)
+    lookback = min(500, n)
+
+    x = np.arange(lookback, dtype=float)
+    weights = np.exp(-(x ** 2) / (bandwidth * bandwidth * 2))
+
+    values = src.values
+    out = np.full(n, np.nan)
+
+    for t in range(n):
+        w = lookback if t + 1 >= lookback else t + 1
+        window = values[t - w + 1 : t + 1][::-1]
+        out[t] = np.dot(window, weights[:w]) / weights[:w].sum()
+
+    out_series = pd.Series(out, index=df.index)
+
+    mae_window = min(499, n)
+    mae = (src - out_series).abs().rolling(mae_window, min_periods=1).mean() * mult
+
+    upper = out_series + mae
+    lower = out_series - mae
+
+    df["nwe_mid"]   = out_series.astype("float32")
+    df["nwe_upper"] = upper.astype("float32")
+    df["nwe_lower"] = lower.astype("float32")
+
+    df["nwe_touches_upper"] = (src >= upper).astype("float32")
+    df["nwe_touches_lower"] = (src <= lower).astype("float32")
+
+    cross_under_lower = (src < lower) & (src.shift(1) >= lower.shift(1))
+    cross_over_upper  = (src > upper) & (src.shift(1) <= upper.shift(1))
+
+    df["nwe_cross_under_lower"] = cross_under_lower.astype("float32")
+    df["nwe_cross_over_upper"]  = cross_over_upper.astype("float32")
+
+    # ── Hold signal active for hold_bars after it fires ────────────────────
+    def _hold_signal(trigger: pd.Series, hold_bars: int) -> np.ndarray:
+        trig = trigger.values.astype(bool)
+        held = np.zeros(len(trig), dtype="float32")
+        countdown = 0
+        for i in range(len(trig)):
+            if trig[i]:
+                countdown = hold_bars           # re-trigger resets the window
+            if countdown > 0:
+                held[i] = 1.0
+                countdown -= 1
+        return held
+
+    def _bars_since(trigger: pd.Series) -> np.ndarray:
+        trig = trigger.values.astype(bool)
+        out_arr = np.full(len(trig), np.nan)
+        last_fire = -1
+        for i in range(len(trig)):
+            if trig[i]:
+                last_fire = i
+            out_arr[i] = (i - last_fire) if last_fire >= 0 else np.nan
+        return out_arr.astype("float32")
+
+    df["nwe_buy_signal"]  = _hold_signal(cross_under_lower, hold_bars)
+    df["nwe_sell_signal"] = _hold_signal(cross_over_upper, hold_bars)
+    df["nwe_bars_since_buy"]  = _bars_since(cross_under_lower)
+    df["nwe_bars_since_sell"] = _bars_since(cross_over_upper)
+
+    return df
+
+def _add_pivot_reversal_strategy(df, left_bars=4, right_bars=2, hold_bars=0, tick=0.01):
+    """
+    Pivot Reversal Strategy features (TradingView built-in strategy, ported).
+
+    Buy/sell triggers
+    ------------------
+    piv_buy_signal   1 on the bar price trades above the pivot-high stop
+                     (this is the actual long entry — Pine's PivRevLE firing)
+    piv_sell_signal  1 on the bar price trades below the pivot-low stop
+                     (this is the actual short entry — Pine's PivRevSE firing)
+    If hold_bars > 0, these stay "active" for hold_bars bars after firing
+    (same held-signal pattern as the NWE feature), in addition to the raw
+    one-bar versions below.
+
+    Other columns added
+    --------------------
+    piv_high, piv_low              confirmed pivot levels, forward-filled
+    piv_new_high, piv_new_low      1 on the bar a new pivot is confirmed
+    piv_long_armed, piv_short_armed  1 while a stop-entry is pending
+    piv_long_entry_raw, piv_short_entry_raw   one-bar-only trigger (no hold)
+    piv_long_stop_price, piv_short_stop_price  the live stop price, ffilled
+    """
+    high = df["High"].values
+    low  = df["Low"].values
+    n    = len(df)
+
+    # ── 1. Pivot detection (shifted forward by right_bars — no lookahead) ──
+    raw_piv_high = np.full(n, np.nan)
+    raw_piv_low  = np.full(n, np.nan)
+
+    for i in range(left_bars, n - right_bars):
+        window_h = high[i - left_bars : i + right_bars + 1]
+        if high[i] == window_h.max() and np.sum(window_h == high[i]) == 1:
+            raw_piv_high[i] = high[i]
+        window_l = low[i - left_bars : i + right_bars + 1]
+        if low[i] == window_l.min() and np.sum(window_l == low[i]) == 1:
+            raw_piv_low[i] = low[i]
+
+    confirmed_high = pd.Series(raw_piv_high, index=df.index).shift(right_bars)
+    confirmed_low  = pd.Series(raw_piv_low,  index=df.index).shift(right_bars)
+
+    swh_cond = confirmed_high.notna()
+    swl_cond = confirmed_low.notna()
+
+    df["piv_new_high"] = swh_cond.astype("float32")
+    df["piv_new_low"]  = swl_cond.astype("float32")
+
+    # ── 2. Carry the pivot level forward until replaced ─────────────────────
+    hprice = confirmed_high.ffill()
+    lprice = confirmed_low.ffill()
+
+    df["piv_high"] = hprice.astype("float32")
+    df["piv_low"]  = lprice.astype("float32")
+
+    # ── 3. Stop-order state machine — the actual buy/sell triggers ──────────
+    le = np.zeros(n, dtype=bool)
+    se = np.zeros(n, dtype=bool)
+    long_entry_raw  = np.zeros(n, dtype="float32")
+    short_entry_raw = np.zeros(n, dtype="float32")
+
+    swh_arr, swl_arr = swh_cond.values, swl_cond.values
+    hprice_arr, lprice_arr = hprice.values, lprice.values
+
+    le_prev = se_prev = False
+    for i in range(n):
+        if swh_arr[i]:
+            le_i = True
+        else:
+            if le_prev and high[i] > hprice_arr[i]:
+                le_i = False
+                long_entry_raw[i] = 1.0      # BUY trigger fires here
+            else:
+                le_i = le_prev
+        le[i] = le_i
+        le_prev = le_i
+
+        if swl_arr[i]:
+            se_i = True
+        else:
+            if se_prev and low[i] < lprice_arr[i]:
+                se_i = False
+                short_entry_raw[i] = 1.0     # SELL trigger fires here
+            else:
+                se_i = se_prev
+        se[i] = se_i
+        se_prev = se_i
+
+    df["piv_long_armed"]  = le.astype("float32")
+    df["piv_short_armed"] = se.astype("float32")
+    df["piv_long_entry_raw"]  = long_entry_raw
+    df["piv_short_entry_raw"] = short_entry_raw
+    df["piv_long_stop_price"]  = (hprice + tick).astype("float32")
+    df["piv_short_stop_price"] = (lprice - tick).astype("float32")
+
+    # ── 4. Buy/sell signals, optionally held for N bars ─────────────────────
+    if hold_bars > 0:
+        def _hold(trigger_arr, hold_bars):
+            held = np.zeros(len(trigger_arr), dtype="float32")
+            countdown = 0
+            for i, fired in enumerate(trigger_arr):
+                if fired:
+                    countdown = hold_bars
+                if countdown > 0:
+                    held[i] = 1.0
+                    countdown -= 1
+            return held
+
+        df["piv_buy_signal"]  = _hold(long_entry_raw, hold_bars)
+        df["piv_sell_signal"] = _hold(short_entry_raw, hold_bars)
+    else:
+        df["piv_buy_signal"]  = long_entry_raw
+        df["piv_sell_signal"] = short_entry_raw
+
     return df
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1183,10 +1510,13 @@ def build_features(df, period="30d", interval="5m", ticker=None):
     df = _add_fvg_stack_features(df)
     df = _add_index_divergence(df, period=period, interval=interval)
     df = _add_breaker_block_features(df, ticker=ticker)
-    df = _add_breaker_confluence_features(df)           # NEW
-    df = _add_htf_trend_alignment(df, ticker=ticker, primary_interval=interval)  # NEW
+    df = _add_breaker_confluence_features(df)           
+    df = _add_htf_trend_alignment(df, ticker=ticker, primary_interval=interval)  
+    df = _add_lorentzian_classification(df)    
+    df = _add_nadaraya_watson_envelope(df, hold_bars=10)   
+    df = _add_pivot_reversal_strategy(df, hold_bars=5)       
 
-    for tf in ["1m", "5m", "15m"]:                      # NEW — binarize displacement
+    for tf in ["1m", "5m", "15m"]:                      
         if f"breaker_displacement_power_{tf}" in df.columns:
             df[f"breaker_strong_displacement_{tf}"] = (
                 df[f"breaker_displacement_power_{tf}"] > 1.5
@@ -1416,6 +1746,11 @@ FEATURES = [
     "breaker_bull_favorable_rr_15m", "breaker_bear_favorable_rr_15m",
     "breaker_strong_displacement_15m", "breaker_volume_confirmed_15m",
     "breaker_unicorn_15m", "breaker_first_retest_15m",
+
+    "lorentzian_signal_long",
+    "lorentzian_signal_short",
+    "lorentzian_bars_since_signal",
+    "lorentzian_prediction",
 
     # ── FinBERT / Finnhub news sentiment  (step 3 — optional) ─────────────
     # Only present when USE_NEWS_SENTIMENT = True.

@@ -39,20 +39,82 @@ import yfinance as yf
 
 from feature_engineering import build_features, FEATURES
 
+import mplfinance as mpf
+import pandas as pd
+
+def plot_target_signals(raw_ohlcv: pd.DataFrame, labeled: pd.DataFrame,
+                         lookback_bars: int = 300,
+                         title: str = "Labeled BUY/SELL Targets",
+                         buy_code: int = 2, sell_code: int = 0):
+    """
+    Plot a candlestick chart with green up-arrows on bars labeled BUY and
+    red down-arrows on bars labeled SELL (from the `target` column produced
+    by build_labeled_dataset() / label_signals()).
+
+    Parameters
+    ----------
+    raw_ohlcv : pd.DataFrame
+        Original OHLCV data (Open/High/Low/Close/Volume, DatetimeIndex).
+    labeled : pd.DataFrame
+        Output of build_labeled_dataset() — must contain a 'target' column
+        sharing the same index (or a subset of it) as raw_ohlcv.
+    lookback_bars : int
+        Only plot the most recent N bars. Set to None to plot everything.
+    buy_code, sell_code : int
+        Target integer codes — defaults match dataset_builder.py (BUY=2, SELL=0).
+        HOLD (1) bars get no marker.
+    """
+    df = raw_ohlcv.copy()
+
+    # labeled may have fewer rows than raw (tail dropped for unlabelable bars),
+    # so align by reindexing and leave HOLD/missing as NaN → no marker drawn.
+    target = labeled["target"].reindex(df.index)
+
+    if lookback_bars is not None:
+        df = df.iloc[-lookback_bars:]
+        target = target.iloc[-lookback_bars:]
+
+    buy_marker  = (df["Low"]  * 0.999).where(target == buy_code)
+    sell_marker = (df["High"] * 1.001).where(target == sell_code)
+
+    addplots = []
+    if buy_marker.notna().any():
+        addplots.append(
+            mpf.make_addplot(buy_marker, type="scatter", markersize=100,
+                              marker="^", color="green")
+        )
+    if sell_marker.notna().any():
+        addplots.append(
+            mpf.make_addplot(sell_marker, type="scatter", markersize=100,
+                              marker="v", color="red")
+        )
+
+    mpf.plot(
+        df,
+        type="candle",
+        style="charles",
+        title=title,
+        addplot=addplots,
+        volume=True,
+        figsize=(16, 8),
+        tight_layout=True,
+    )
+
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG  ←  everything you need to edit lives here
 # ─────────────────────────────────────────────────────────────────────────────
 
-TICKER   = "SPY"
+TICKER   = "BTC"
 PERIOD   = "60d"    # yfinance download window
 INTERVAL = "5m"     # bar frequency; must match build_features() expectation
 
-FORWARD_BARS  = 6           # look-ahead bars for labelling (6 × 5 m = 30 min)
+FORWARD_BARS  = 8           # look-ahead bars for labelling (18 × 5 m = 90 min)
 
 LABEL_METHOD  = "atr_mult"  # "fixed_pct" | "atr_mult" | "rolling_std"
-PCT_THRESHOLD = 0.003       # ±0.30 %  — only used when LABEL_METHOD = "fixed_pct"
-ATR_MULT      = 1.0         # ATR multiplier — only used when LABEL_METHOD = "atr_mult"
+PCT_THRESHOLD = 0.05       # ±0.30 %  — only used when LABEL_METHOD = "fixed_pct"
+ATR_MULT      = 4.5         # ATR multiplier — only used when LABEL_METHOD = "atr_mult"
 STD_MULT      = 1.0         # std multiplier — only used when LABEL_METHOD = "rolling_std"
 
 # ── News sentiment ────────────────────────────────────────────────────────────
@@ -336,6 +398,7 @@ def _build_enriched(
     print("       expect ~20–40 s for 60 days of 5-min data.)")
     enriched = build_features(raw, period=period, interval=interval, ticker=ticker)
     print(f"      Done — {enriched.shape[1]} columns after technical features.")
+    print(f"      Lorentzian cols present: {[c for c in enriched.columns if 'lorentzian' in c.lower()]}")   # ADD THIS
 
     # ── [3] News sentiment ────────────────────────────────────────────────────
     if USE_NEWS_SENTIMENT:
@@ -447,22 +510,18 @@ def build_labeled_dataset(
     # ── [5] Finalise ──────────────────────────────────────────────────────────
     print("[5/5] Selecting Close + features, cleaning and finalising …")
 
-    # Candidate columns come entirely from feat_cols, which is derived from
-    # feature_engineering.FEATURES (+ news cols) — no separate hand-kept list.
-    # Previously narrowed further to _is_binary_col(...) only — that filter
-    # is now removed, so continuous columns uncommented in FEATURES (ADX,
-    # lorentzian_prediction, lorentzian_bars_since_signal, etc.) survive too.
-    candidates = [c for c in feat_cols if c != "Close" and c in enriched.columns]
+    candidates = [
+    c for c in feat_cols
+    if c != "Close" and c in enriched.columns and _is_binary_col(enriched[c])
+]
     keep       = list(dict.fromkeys(["Close"] + candidates + ["target"]))
     dataset    = enriched[keep].copy()
 
-    # Drop unlabelable tail rows (target NaN for last FORWARD_BARS bars)
     n_before = len(dataset)
     dataset  = dataset.dropna(subset=["target"])
     n_after  = len(dataset)
     print(f"  Dropped {n_before - n_after:,} tail rows. {n_after:,} rows remain.")
 
-    # NaN handling for feature columns
     dataset = _clean_features(dataset, candidates)
 
     # Safe to cast now that all NaN rows are gone
@@ -676,3 +735,19 @@ if __name__ == "__main__":
 
     print(f"\nFiltered labeled — first 3 rows:")
     print(filtered_labeled.head(3).to_string())
+
+if __name__ == "__main__":
+    from dataset_builder import build_labeled_dataset, TICKER, PERIOD, INTERVAL
+    import yfinance as yf
+
+    # Need raw OHLCV separately since build_labeled_dataset() only returns
+    # Close + boolean feature cols + target, not High/Low/Open/Volume.
+    raw = yf.download(TICKER, period=PERIOD, interval=INTERVAL,
+                       progress=False, auto_adjust=True)
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = raw.columns.get_level_values(0)
+
+    labeled = build_labeled_dataset(TICKER, PERIOD, INTERVAL)
+
+    plot_target_signals(raw, labeled, lookback_bars=300,
+                         title=f"{TICKER} — Labeled BUY/SELL Targets")

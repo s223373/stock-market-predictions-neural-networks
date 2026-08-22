@@ -106,6 +106,10 @@ SHARED_FEATURES = [
     "lorentzian_signal_short",
     "lorentzian_bars_since_signal",
     "lorentzian_prediction",
+    "nwe_buy_signal",
+    "nwe_sell_signal",
+    "piv_buy_signal",
+    "piv_sell_signal",
 ]
 
 # Which 2 breaker columns belong to which timeframe's tree, kept separate
@@ -136,9 +140,9 @@ TIMEFRAME_FEATURES = {
 FORCE_COLS = ["_breaker_active", "_lorentzian_active"]
 
 # Split fractions (must sum to 1.0); all chronological — no shuffling
-TRAIN_FRAC      = 0.70   # oldest 70 % → hyperparameter tuning
+TRAIN_FRAC      = 0.60   # oldest 60 % → hyperparameter tuning
 CAL_FRAC        = 0.15   # next  15 % → probability calibration
-# TEST_FRAC     = 0.15   # final 15 % → held-out evaluation (implicit)
+# TEST_FRAC     = 0.25   # final 25 % → held-out evaluation (implicit)
 
 RANDOM_STATE    = 42
 N_ITER          = 40     # unused now that this uses GridSearchCV, not
@@ -153,7 +157,7 @@ CV_SPLITS       = 3      # TimeSeriesSplit folds inside training set
 # max_features all genuinely matter here.
 PARAM_DIST = {
     "criterion"        : ["gini", "entropy"],
-    "max_depth"        : [7],
+    "max_depth"        : [2, 3, 4, 5, 6, None],
     "min_samples_leaf" : [1, 5, 10, 20],
     "min_samples_split": [2, 10, 20],
     "max_features"     : [None],
@@ -169,7 +173,7 @@ IMP_THRESHOLD   = 0.0
 # All BUY and SELL rows are kept.  Only this fraction of HOLD rows are kept.
 # 0.2 = keep 20% of HOLD bars → forces the model to treat BUY/SELL as equally
 # common during training without artificially reweighting loss.
-HOLD_KEEP_FRACTION = 0.2
+TARGET_BS_RATIO = 0.8   
 
 # Any-tree-fires prediction
 # If any single tree in the forest predicts BUY or SELL with leaf purity >=
@@ -241,21 +245,6 @@ def load_and_prepare(df, interval=INTERVAL):
     X = df[features].copy()
     y = df["target"]
 
-    # Combined force-flags — only build if the underlying columns survived
-    # into this timeframe's dataset. Guard against KeyError rather than
-    # assuming they're always present.
-    bull_col, bear_col = TIMEFRAME_BREAKER_PAIR[interval][0], TIMEFRAME_BREAKER_PAIR[interval][1]
-    if bull_col in X.columns and bear_col in X.columns:
-        X["_breaker_active"] = ((X[bull_col] > 0) | (X[bear_col] > 0)).astype(int)
-    else:
-        print(f"  ⚠  Skipping _breaker_active — {bull_col}/{bear_col} not in X for '{interval}'.")
-
-    if "lorentzian_signal_long" in X.columns and "lorentzian_signal_short" in X.columns:
-        X["_lorentzian_active"] = ((X["lorentzian_signal_long"] > 0) | (X["lorentzian_signal_short"] > 0)).astype(int)
-    else:
-        print(f"  ⚠  Skipping _lorentzian_active — lorentzian_signal_long/short not in X for '{interval}'.")
-        print(f"     df.columns sample: {[c for c in df.columns if 'lorentzian' in c]}")
-
     print(f"   Feature matrix : {X.shape[0]:,} rows × {X.shape[1]} cols")
     print(f"   Features used  : {list(X.columns)}")
     print(f"   Class counts   : {dict(y.value_counts().sort_index())}")
@@ -292,43 +281,38 @@ def chronological_split(X, y):
     return X_train, X_cal, X_test, y_train, y_cal, y_test
 
 
-def undersample_hold(X_train, y_train, keep_fraction=HOLD_KEEP_FRACTION):
+def undersample_hold(X_train, y_train, target_bs_ratio=0.8):
     """
-    Keep every BUY and SELL row but randomly discard most HOLD rows.
+    Keep every BUY/SELL row. Sample HOLD rows so that BUY+SELL make up
+    target_bs_ratio of the final training set (default 80%), i.e.
+    HOLD makes up (1 - target_bs_ratio) (default 20%).
 
-    Why undersample instead of (or alongside) class_weight?
-    --------------------------------------------------------
-    class_weight='balanced' keeps all rows but upweights BUY/SELL losses
-    during training. The tree still sees the full HOLD-heavy dataset and
-    learns its distribution — it just penalises HOLD mistakes less.
-    Undersampling physically removes HOLD rows so the tree trains on a
-    dataset where BUY/SELL/HOLD are roughly equally frequent. Doing both
-    together (as this file does) is belt-and-suspenders, not redundant —
-    undersampling shapes what the tree SEES, class_weight shapes how much
-    each mistake COSTS during that training.
+        n_hold_keep = n_buy_sell * (1 - target_bs_ratio) / target_bs_ratio
 
-    Note: undersampling is applied only to the training split. Cal and
-    test sets are left intact so evaluation reflects the true class
-    distribution.
+    If there aren't enough HOLD rows to hit that ratio, keep all of them
+    (can't oversample here — ratio then skews more toward BUY/SELL than requested).
     """
     rng = np.random.default_rng(RANDOM_STATE)
 
     buy_sell_idx = y_train[y_train != HOLD].index
     hold_idx     = y_train[y_train == HOLD].index
 
-    n_keep    = max(1, int(len(hold_idx) * keep_fraction))
-    kept_hold = rng.choice(hold_idx, size=n_keep, replace=False)
+    n_bs = len(buy_sell_idx)
+    n_hold_target = int(round(n_bs * (1 - target_bs_ratio) / target_bs_ratio))
+    n_keep = min(n_hold_target, len(hold_idx))
+
+    kept_hold = rng.choice(hold_idx, size=n_keep, replace=False) if n_keep > 0 else np.array([], dtype=hold_idx.dtype)
 
     keep_idx = buy_sell_idx.tolist() + kept_hold.tolist()
 
-    X_out = X_train.loc[keep_idx].sort_index()   # preserve chronological order
+    X_out = X_train.loc[keep_idx].sort_index()
     y_out = y_train.loc[keep_idx].sort_index()
 
-    print(f"\n── HOLD undersampling (keep_fraction={keep_fraction}) ──────")
-    print(f"   Before : {len(y_train):,} rows  "
-          f"{dict(y_train.value_counts().sort_index())}")
-    print(f"   After  : {len(y_out):,} rows  "
-          f"{dict(y_out.value_counts().sort_index())}")
+    print(f"\n── HOLD undersampling (target BUY+SELL ratio={target_bs_ratio}) ──")
+    print(f"   Before : {len(y_train):,} rows  {dict(y_train.value_counts().sort_index())}")
+    print(f"   After  : {len(y_out):,} rows  {dict(y_out.value_counts().sort_index())}")
+    actual_ratio = n_bs / len(y_out) if len(y_out) else 0
+    print(f"   Actual BUY+SELL ratio: {actual_ratio:.3f}")
     return X_out, y_out
 
 
@@ -347,7 +331,7 @@ def undersample_hold(X_train, y_train, keep_fraction=HOLD_KEEP_FRACTION):
 # zipped together positionally; they need a shared reference axis to align
 # onto. 5m is a reasonable middle-ground default; change this if you'd
 # rather report on 1m's or 15m's cadence instead.
-PRIMARY_TF = "5m"
+PRIMARY_TF = "1m"
 
 
 def align_predictions_to_primary(pred_series: pd.Series, primary_index: pd.DatetimeIndex) -> np.ndarray:
@@ -424,6 +408,49 @@ def plot_tree_feature_importances(grids, output_path="tree_feature_importances.p
     print(f"\n✓  Saved feature importance chart → {output_path}")
     return output_path
 
+def balance_classes_equal(X_train, y_train):
+    """
+    Downsample all three classes (BUY, SELL, HOLD) to the same size — the
+    count of whichever class has the fewest rows — so the model sees
+    ~33% of each class in training.
+    """
+    rng = np.random.default_rng(RANDOM_STATE)
+
+    idx_by_class = {
+        cls: y_train[y_train == cls].index
+        for cls in [BUY, SELL, HOLD]
+    }
+    counts_before = {cls: len(idx) for cls, idx in idx_by_class.items()}
+    n_min = min(counts_before.values())
+
+    if n_min == 0:
+        raise ValueError(
+            f"At least one class has zero training rows after your "
+            f"labelling threshold: {counts_before}. Lower the threshold "
+            f"or widen FORWARD_BARS — there's nothing to balance to."
+        )
+
+    keep_idx = []
+    for cls, idx in idx_by_class.items():
+        if len(idx) > n_min:
+            # FIX: sample positions (ints), not the DatetimeIndex itself —
+            # rng.choice on a DatetimeIndex silently corrupts the values
+            # (converts to plain datetime.datetime, which then fails to
+            # match X_train's pd.Timestamp index in .loc[]).
+            positions = rng.choice(len(idx), size=n_min, replace=False)
+            sampled = idx[positions]
+        else:
+            sampled = idx
+        keep_idx.extend(sampled.tolist())
+
+    X_out = X_train.loc[keep_idx].sort_index()
+    y_out = y_train.loc[keep_idx].sort_index()
+
+    print(f"\n── Equal-class balancing (target ~33% each) ──")
+    print(f"   Before : {dict(y_train.value_counts().sort_index())}")
+    print(f"   After  : {dict(y_out.value_counts().sort_index())}   (n_min={n_min} per class)")
+    return X_out, y_out
+
 
 def build_model(ticker=TICKER, period=PERIOD, intervals=INTERVALS):
     """
@@ -454,12 +481,14 @@ def build_model(ticker=TICKER, period=PERIOD, intervals=INTERVALS):
                           # other two timeframes have something to align onto
     test_index = {}     # tf -> the DatetimeIndex of that tf's own test slice
 
+    FORCE_COLS_CANDIDATES = ["_breaker_active", "_lorentzian_active"]
+
     for tf in intervals:
         X, y = load_and_prepare(datasets[tf], interval=tf)
         X_train, X_cal, X_test, y_train, y_cal, y_test = chronological_split(X, y)
-        X_train, y_train = undersample_hold(X_train, y_train)
+        X_train, y_train = undersample_hold(X_train, y_train, target_bs_ratio=TARGET_BS_RATIO)  # was: undersample_hold(...)
 
-        tree = ForcedRootTree(force_cols=FORCE_COLS, random_state=RANDOM_STATE)
+        tree = DecisionTreeClassifier(class_weight="balanced", random_state=RANDOM_STATE)
         grid = GridSearchCV(
             estimator=tree,
             param_grid=PARAM_DIST,
