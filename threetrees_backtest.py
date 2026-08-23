@@ -4,16 +4,20 @@ import yfinance as yf
 from feature_engineering import build_features
 from three_trees import build_model, TICKER, TIMEFRAME_PERIODS, PRIMARY_TF, BUY, SELL, HOLD, plot_tree_feature_importances
 
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+
 MAX_HOLD_BARS = 100
-STOP_CAP_PCT = 0.003
+STOP_CAP_PCT = 0.005
 FEE_BPS = 1.0
 TARGET_PULLBACK = 0.1
-MIN_RR = 0.5
+MIN_RR = 1.0
 
 EXTENDED_HOLD_BARS = 300   # NEW — how far forward to simulate "held longer" for
 
 def backtest():
     grids, preds, tests, combined = build_model()
+    
     plot_tree_feature_importances(grids)
     primary_test_idx = tests[PRIMARY_TF].index
 
@@ -33,6 +37,8 @@ def backtest():
     bear_tp = pdf[f"breaker_bear_target_price_{PRIMARY_TF}"].values
     bull_edge = pdf[f"breaker_bull_zone_edge_{PRIMARY_TF}"].values
     bear_edge = pdf[f"breaker_bear_zone_edge_{PRIMARY_TF}"].values
+
+    plot_signal_comparison(pdf, combined)
 
     n = len(combined)
     equity = np.ones(n + 1)
@@ -244,5 +250,35 @@ def backtest():
 
     return equity, trades, left_on_table, left_on_table_reason, hl_extra_ret, hl_reason
 
+
+
+def plot_signal_comparison(pdf, combined):
+    idx = pdf.index
+    close = pdf["Close"].values
+
+    fig, ax = plt.subplots(figsize=(16, 6))
+    ax.plot(idx, close, color="black", linewidth=0.8, label="Close")
+
+    pred_buy = idx[combined == BUY]
+    pred_sell = idx[combined == SELL]
+    ax.scatter(pred_buy, close[combined == BUY], marker="^", color="green", s=70, label="Predicted BUY")
+    ax.scatter(pred_sell, close[combined == SELL], marker="v", color="red", s=70, label="Predicted SELL")
+
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig("signal_comparison.png", dpi=150)
+    plt.show()
+
 if __name__ == "__main__":
-    backtest()
+    equity, trades, left_on_table, left_on_table_reason, hl_extra_ret, hl_reason = backtest()
+
+    save = input("\nDownload/save the trained models? (y/n): ").strip().lower()
+    if save == "y":
+        import joblib
+        grids, preds, tests, combined = build_model()
+        for tf, grid in grids.items():
+            fname = f"model_{tf}.joblib"
+            joblib.dump(grid.best_estimator_ if hasattr(grid, "best_estimator_") else grid, fname)
+            print(f"Saved {fname}")
+    else:
+        print("Skipping model save.")

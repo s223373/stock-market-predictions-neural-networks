@@ -19,7 +19,7 @@ from force_features import ForcedRootTree
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Data
-TICKER          = "SPY"
+TICKER          = "BTC"
 PERIOD          = "60d"
 INTERVAL        = "1m"
 
