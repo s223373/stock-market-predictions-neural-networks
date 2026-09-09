@@ -1735,17 +1735,24 @@ FEATURES = [
     "breaker_near_eq_liquidity",
 
     # ── breaker confluence (per-timeframe) ───────────────────
-    "breaker_bull_favorable_rr_1m", "breaker_bear_favorable_rr_1m",
-    "breaker_strong_displacement_1m", "breaker_volume_confirmed_1m",
-    "breaker_unicorn_1m", "breaker_first_retest_1m",
+    "breaker_bull_favorable_rr_1m", 
+    "breaker_bear_favorable_rr_1m",
+    "breaker_strong_displacement_1m", 
+    "breaker_volume_confirmed_1m",
+    "breaker_unicorn_1m", 
+    "breaker_first_retest_1m",
 
-    "breaker_bull_favorable_rr_5m", "breaker_bear_favorable_rr_5m",
+   "breaker_bull_favorable_rr_5m", "breaker_bear_favorable_rr_5m",
+
     "breaker_strong_displacement_5m", "breaker_volume_confirmed_5m",
-    "breaker_unicorn_5m", "breaker_first_retest_5m",
+    "breaker_unicorn_5m", 
+    "breaker_first_retest_5m",
 
     "breaker_bull_favorable_rr_15m", "breaker_bear_favorable_rr_15m",
+
     "breaker_strong_displacement_15m", "breaker_volume_confirmed_15m",
-    "breaker_unicorn_15m", "breaker_first_retest_15m",
+    "breaker_unicorn_15m",
+    "breaker_first_retest_15m",
 
     "lorentzian_signal_long",
     "lorentzian_signal_short",

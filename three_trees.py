@@ -19,7 +19,7 @@ from force_features import ForcedRootTree
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Data
-TICKER          = "BTC"
+TICKER          = "SPY"
 PERIOD          = "60d"
 INTERVAL        = "1m"
 
@@ -137,6 +137,17 @@ TIMEFRAME_FEATURES = {
     for tf, pair in TIMEFRAME_BREAKER_PAIR.items()
 }
 
+N_SHARED_TREES = 7
+
+def _split_shared_features(features, n_splits):
+    """Divide SHARED_FEATURES into n_splits near-equal, non-overlapping chunks."""
+    chunks = [[] for _ in range(n_splits)]
+    for i, feat in enumerate(features):
+        chunks[i % n_splits].append(feat)
+    return chunks
+
+SHARED_FEATURE_CHUNKS = _split_shared_features(SHARED_FEATURES, N_SHARED_TREES)
+
 FORCE_COLS = ["_breaker_active", "_lorentzian_active"]
 
 # Split fractions (must sum to 1.0); all chronological — no shuffling
@@ -225,6 +236,58 @@ def build_multi_timeframe_datasets(ticker=TICKER, intervals=INTERVALS):
         datasets[tf] = build_labeled_dataset(ticker=ticker, period=period, interval=tf)
 
     return datasets
+
+def train_shared_tree(df, feature_cols, label):
+    """Train a single DecisionTree on the given feature subset of the
+    PRIMARY_TF dataset (shared trees don't need their own timeframe —
+    they all read off the same dataframe as PRIMARY_TF)."""
+    cols = [c for c in feature_cols if c in df.columns]
+    missing = [c for c in feature_cols if c not in df.columns]
+    if missing:
+        print(f"[{label}] ⚠ missing from df: {missing}")
+    if not cols:
+        raise ValueError(
+            f"[{label}] no requested columns found in df. "
+            f"Requested: {feature_cols}. df has {len(df.columns)} cols total."
+        )
+
+    X = df[cols].copy()
+    y = df["target"]
+
+    X_train, X_cal, X_test, y_train, y_cal, y_test = chronological_split(X, y)
+    X_train, y_train = undersample_hold(X_train, y_train, target_bs_ratio=TARGET_BS_RATIO)
+
+    tree = DecisionTreeClassifier(class_weight="balanced", random_state=RANDOM_STATE)
+    grid = GridSearchCV(
+        estimator=tree, param_grid=PARAM_DIST,
+        cv=TimeSeriesSplit(n_splits=CV_SPLITS),
+        scoring="f1_macro", n_jobs=-1,
+    )
+    grid.fit(X_train, y_train)
+    y_pred = grid.predict(X_test)
+
+    print(f"\n{'=' * 60}")
+    print(f"  Shared tree: {label}  ({len(cols)} features)")
+    print(f"{'=' * 60}")
+    print(f"  Features           : {cols}")
+    print(f"  Best params        : {grid.best_params_}")
+    print(f"  Best CV F1 (macro) : {grid.best_score_:.4f}")
+    print(f"  Test accuracy      : {grid.score(X_test, y_test):.4f}")
+    print(classification_report(y_test, y_pred, zero_division=0))
+
+    full_pred = pd.Series(grid.predict(X), index=X.index)
+    return grid, y_pred, y_test, X_test.index, full_pred
+
+def combine_signals(*preds_list):
+    """Majority vote across N trees' predictions (already aligned)."""
+    preds = np.stack(preds_list, axis=1)
+    buy_count  = (preds == BUY).sum(axis=1)
+    sell_count = (preds == SELL).sum(axis=1)
+
+    signal = np.full(preds.shape[0], HOLD, dtype=int)
+    signal[buy_count  > sell_count] = BUY
+    signal[sell_count > buy_count]  = SELL
+    return signal
 
 
 def load_and_prepare(df, interval=INTERVAL):
@@ -351,35 +414,35 @@ def align_predictions_to_primary(pred_series: pd.Series, primary_index: pd.Datet
     return merged["pred"].fillna(HOLD).astype(int).values
 
 
-def combine_signals(pred_1m: np.ndarray, pred_5m: np.ndarray, pred_15m: np.ndarray) -> np.ndarray:
-    """
-    Combine three trees' per-bar predictions (already aligned onto the same
-    timestamp axis) into one signal.
+# def combine_signals(pred_1m: np.ndarray, pred_5m: np.ndarray, pred_15m: np.ndarray) -> np.ndarray:
+#     """
+#     Combine three trees' per-bar predictions (already aligned onto the same
+#     timestamp axis) into one signal.
 
-    Rule
-    ----
-    buy_count  = how many of the three trees predict BUY
-    sell_count = how many of the three trees predict SELL
+#     Rule
+#     ----
+#     buy_count  = how many of the three trees predict BUY
+#     sell_count = how many of the three trees predict SELL
 
-        signal = BUY   if buy_count  > sell_count
-        signal = SELL  if sell_count > buy_count
-        signal = HOLD  otherwise (a tie, including 0-0 or 1-1)
+#         signal = BUY   if buy_count  > sell_count
+#         signal = SELL  if sell_count > buy_count
+#         signal = HOLD  otherwise (a tie, including 0-0 or 1-1)
 
-    This is exactly the rule as specified — "one buy and zero sells, or two
-    buys -> BUY" (mirrored for SELL) — just written as a direct comparison:
-    buy_count(1) > sell_count(0) covers the first case, buy_count(2) beats
-    any sell_count <= 1 covers the second. The same comparison naturally
-    extends to cases not spelled out explicitly (three buys; two buys with
-    one sell) the same way — larger count wins, matching count is a tie.
-    """
-    preds = np.stack([pred_1m, pred_5m, pred_15m], axis=1)
-    buy_count  = (preds == BUY).sum(axis=1)
-    sell_count = (preds == SELL).sum(axis=1)
+#     This is exactly the rule as specified — "one buy and zero sells, or two
+#     buys -> BUY" (mirrored for SELL) — just written as a direct comparison:
+#     buy_count(1) > sell_count(0) covers the first case, buy_count(2) beats
+#     any sell_count <= 1 covers the second. The same comparison naturally
+#     extends to cases not spelled out explicitly (three buys; two buys with
+#     one sell) the same way — larger count wins, matching count is a tie.
+#     """
+#     preds = np.stack([pred_1m, pred_5m, pred_15m], axis=1)
+#     buy_count  = (preds == BUY).sum(axis=1)
+#     sell_count = (preds == SELL).sum(axis=1)
 
-    signal = np.full(len(pred_1m), HOLD, dtype=int)
-    signal[buy_count  > sell_count] = BUY
-    signal[sell_count > buy_count]  = SELL
-    return signal
+#     signal = np.full(len(pred_1m), HOLD, dtype=int)
+#     signal[buy_count  > sell_count] = BUY
+#     signal[sell_count > buy_count]  = SELL
+#     return signal
 
 def plot_tree_feature_importances(grids, output_path="tree_feature_importances.png"):
     """
@@ -523,6 +586,33 @@ def build_model(ticker=TICKER, period=PERIOD, intervals=INTERVALS):
         # two timeframes have a complete series to align onto — not just
         # this tree's own test window.
         full_preds[tf] = pd.Series(grid.predict(X), index=X.index)
+
+        # ── Train 7 additional shared-feature-only trees on PRIMARY_TF's data ────
+    primary_df = datasets[PRIMARY_TF]
+    print(f"\n[debug] primary_df columns ({len(primary_df.columns)}): {sorted(primary_df.columns)}")
+    print(f"[debug] SHARED_FEATURES ({len(SHARED_FEATURES)}): {SHARED_FEATURES}")
+    print(f"[debug] shared_1 chunk: {SHARED_FEATURE_CHUNKS[0]}")
+    shared_full_preds = []
+    for i, chunk in enumerate(SHARED_FEATURE_CHUNKS):
+        _, _, _, _, full_pred = train_shared_tree(
+            primary_df, chunk, label=f"shared_{i+1}"
+        )
+        shared_full_preds.append(full_pred)
+
+    # ── Combine the three per-timeframe trees onto PRIMARY_TF's test cadence ─
+    primary_index = test_index[PRIMARY_TF]
+    aligned = {
+        tf: (full_preds[tf].reindex(primary_index).ffill().fillna(HOLD).astype(int).values
+             if tf == PRIMARY_TF
+             else align_predictions_to_primary(full_preds[tf], primary_index))
+        for tf in intervals
+    }
+    shared_aligned = [
+        s.reindex(primary_index).ffill().fillna(HOLD).astype(int).values
+        for s in shared_full_preds
+    ]
+
+    combined = combine_signals(aligned["1m"], aligned["5m"], aligned["15m"], *shared_aligned)
 
     # ── Combine the three trees onto PRIMARY_TF's test cadence ───────────────
     primary_index = test_index[PRIMARY_TF]

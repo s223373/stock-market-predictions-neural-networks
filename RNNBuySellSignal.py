@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import datetime
 from sklearn.preprocessing import MinMaxScaler
-from news_sentiment import SentimentPipeline
+#from news_sentiment import SentimentPipeline
 from feature_engineering import build_features, FEATURES
 from model import StockPriceLSTMNetwork, DirectionalLoss, prepare_price_input, StockPriceLSTMNetworkDualStream
 
@@ -14,7 +14,7 @@ from model import StockPriceLSTMNetwork, DirectionalLoss, prepare_price_input, S
 
 TICKER      = "SPY"
 WINDOW_SIZE = 14
-EPOCHS      = 200
+EPOCHS      = 30
 HIDDEN_SIZE = 64
 LR          = 0.001
 
@@ -22,13 +22,13 @@ LR          = 0.001
 # DATA
 # ─────────────────────────────────────────────────────────────────────────────
 
-pipe = SentimentPipeline(TICKER, days_back=35)
+#pipe = SentimentPipeline(TICKER, days_back=35)
 
 df = yf.download(TICKER, period="30d", interval="5m", progress=False)
 df.columns = df.columns.get_level_values(0)
 df.index   = pd.to_datetime(df.index)
 df         = build_features(df, period="30d", interval="5m")
-df         = pipe.add_sentiment_features(df)
+#df         = pipe.add_sentiment_features(df)
 
 assert FEATURES[0] == "Close", "FEATURES[0] must be 'Close'."
 
@@ -169,15 +169,23 @@ else:
     # Saves the best checkpoint (lowest avg loss), not the final epoch.
     # alpaca_trader.py loads this same dict — keep keys in sync.
     # ─────────────────────────────────────────────────────────────────────────
-    now       = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    save_path = f"StockPriceLSTMNetwork_{now}.pt"
-    torch.save({
-        "model_state_dict": best_state,   # best epoch, not last
-        "n_bool_features":  n_bool,
-        "hidden_size":      HIDDEN_SIZE,
-        "bool_cols":        bool_cols,
-        "close_scaler":     close_scaler,
-        "window_size":      WINDOW_SIZE,
-    }, save_path)
-    print(f"\nModel saved → {save_path}")
-    print(f"Best avg loss: {best_loss:.8f}")
+    print(f"\nTraining complete. Best avg loss: {best_loss:.8f}")
+
+    save_choice = input("Save this model? (y/n): ").strip().lower()
+    while save_choice not in ("y", "n"):
+        save_choice = input("Please enter 'y' or 'n': ").strip().lower()
+
+    if save_choice == "y":
+        now       = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        save_path = f"StockPriceLSTMNetwork_{now}.pt"
+        torch.save({
+            "model_state_dict": best_state,   # best epoch, not last
+            "n_bool_features":  n_bool,
+            "hidden_size":      HIDDEN_SIZE,
+            "bool_cols":        bool_cols,
+            "close_scaler":     close_scaler,
+            "window_size":      WINDOW_SIZE,
+        }, save_path)
+        print(f"\nModel saved → {save_path}")
+    else:
+        print("\nModel discarded.")

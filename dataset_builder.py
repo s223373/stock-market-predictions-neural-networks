@@ -114,7 +114,7 @@ FORWARD_BARS  = 8           # look-ahead bars for labelling (18 × 5 m = 90 min)
 
 LABEL_METHOD  = "atr_mult"  # "fixed_pct" | "atr_mult" | "rolling_std"
 PCT_THRESHOLD = 0.05       # ±0.30 %  — only used when LABEL_METHOD = "fixed_pct"
-ATR_MULT      = 4.5         # ATR multiplier — only used when LABEL_METHOD = "atr_mult"
+ATR_MULT      = 4.0         # ATR multiplier — only used when LABEL_METHOD = "atr_mult"
 STD_MULT      = 1.0         # std multiplier — only used when LABEL_METHOD = "rolling_std"
 
 # ── News sentiment ────────────────────────────────────────────────────────────
@@ -224,6 +224,22 @@ def _period_to_days(period: str) -> int:
         n, unit = int(match.group(1)), match.group(2)
         return n * {"d": 1, "mo": 30, "y": 365}[unit]
     return 365   # fallback for "ytd", "max", unrecognised strings
+
+def dedupe_consecutive_signals(signal: pd.Series) -> pd.Series:
+    """
+    Collapse consecutive runs of the same BUY/SELL label to just the last
+    bar in each run. Overlapping forward-return windows mean several bars
+    in a row often cross the threshold right before the same big move —
+    this keeps only the final trigger (closest to the move) and turns the
+    rest of the run back to HOLD.
+    """
+    out = signal.copy()
+    is_signal = out.isin([BUY, SELL])
+    # True where this bar's label differs from the NEXT bar's label
+    # (i.e. this bar is the last one in its run)
+    end_of_run = is_signal & (out != out.shift(-1))
+    out.loc[is_signal & ~end_of_run] = HOLD
+    return out
 
 
 def _compute_atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
@@ -506,6 +522,7 @@ def build_labeled_dataset(
         f"(≈ {FORWARD_BARS * bar_num} {bar_unit} look-ahead) …"
     )
     enriched["target"] = label_signals(enriched)
+    # enriched["target"] = dedupe_consecutive_signals(enriched["target"])
 
     # ── [5] Finalise ──────────────────────────────────────────────────────────
     print("[5/5] Selecting Close + features, cleaning and finalising …")
