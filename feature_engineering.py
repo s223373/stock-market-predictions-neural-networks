@@ -1756,8 +1756,8 @@ FEATURES = [
 
     "lorentzian_signal_long",
     "lorentzian_signal_short",
-    "lorentzian_bars_since_signal",
-    "lorentzian_prediction",
+    # "lorentzian_bars_since_signal",
+    # "lorentzian_prediction",
 
     # ── FinBERT / Finnhub news sentiment  (step 3 — optional) ─────────────
     # Only present when USE_NEWS_SENTIMENT = True.

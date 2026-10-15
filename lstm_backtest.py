@@ -486,8 +486,15 @@ def main():
     )
     metrics = compute_and_print_metrics(results)
 
-    results.to_csv(SAVE_RESULTS, index=False)
-    print(f"[output] Results saved → {SAVE_RESULTS}")
+    # ── Print full results table to terminal instead of saving to CSV ────────
+    pd.set_option("display.max_rows", None)
+    pd.set_option("display.width", None)
+    pd.set_option("display.max_columns", None)
+    print("\n" + "═" * 60)
+    print("  FULL WINDOW-BY-WINDOW RESULTS")
+    print("═" * 60)
+    print(results.to_string(index=False))
+
     return results, metrics
 
 
