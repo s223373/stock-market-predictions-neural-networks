@@ -106,9 +106,9 @@ def plot_target_signals(raw_ohlcv: pd.DataFrame, labeled: pd.DataFrame,
 # CONFIG  ←  everything you need to edit lives here
 # ─────────────────────────────────────────────────────────────────────────────
 
-TICKER   = "BTC"
-PERIOD   = "60d"    # yfinance download window
-INTERVAL = "5m"     # bar frequency; must match build_features() expectation
+TICKER   = "BTC-USD"
+PERIOD   = "7d"    # yfinance download window
+INTERVAL = "1m"     # bar frequency; must match build_features() expectation
 
 FORWARD_BARS  = 8           # look-ahead bars for labelling (18 × 5 m = 90 min)
 

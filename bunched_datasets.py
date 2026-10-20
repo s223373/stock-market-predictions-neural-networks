@@ -120,7 +120,7 @@ def build_bunched_datasets(
                          "are uncommented in feature_engineering.FEATURES.")
 
     bar = base.index.to_series().diff().median()
-    print(f"\n  1m base frame : {len(base):,} bars  "
+    print(f"\n  Base frame    : {len(base):,} bars  "
           f"({base.index.min()} -> {base.index.max()})")
     print(f"  Bar length    : {bar}   (expected {interval})")
     print(f"  Bool features : {len(bool_cols)}")
