@@ -9,8 +9,8 @@ from bunched_datasets import build_bunched_datasets
 # ── Trade settings ───────────────────────────────────────────────────────────
 MAX_HOLD_BARS = 100          # in 1m bars
 FEE_BPS = 1.0
-TARGET_PCT = 0.1
-STOP_PCT = 0.05
+TARGET_PCT = 0.01
+STOP_PCT = 0.005
 TRAIN_FRAC = 0.8             # last (1 - TRAIN_FRAC) of the timeline = walk-forward test region
 
 # "start" -> enter at the FIRST 1m bar of the 5-bar sample (lookahead, optimistic)
