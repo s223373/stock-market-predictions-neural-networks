@@ -7,10 +7,14 @@ from dataset_builder import BUY, HOLD, SELL, FORWARD_BARS
 from bunched_datasets import build_bunched_datasets
 
 # ── Trade settings ───────────────────────────────────────────────────────────
-MAX_HOLD_BARS = 100          # in 1m bars
+MAX_HOLD_BARS = 60          # matches the explorer's horizon the pairs were optimized on
 FEE_BPS = 1.0
-TARGET_PCT = 0.01
-STOP_PCT = 0.005
+
+# Side-specific exits, optimized in signal_explorer (best TRAIN pair per side)
+BUY_TARGET_PCT  = 0.0040    # +0.40%
+BUY_STOP_PCT    = 0.0015    # -0.15%
+SELL_TARGET_PCT = 0.0055    # -0.55%
+SELL_STOP_PCT   = 0.0035 
 TRAIN_FRAC = 0.8             # last (1 - TRAIN_FRAC) of the timeline = walk-forward test region
 
 # "start" -> enter at the FIRST 1m bar of the 5-bar sample (lookahead, optimistic)
@@ -152,14 +156,14 @@ def simulate(close, signals_at, offsets_at=None):
         if s == BUY:
             position = 1
             entry_price = px
-            target = px * (1 + TARGET_PCT)
-            stop = px * (1 - STOP_PCT)
+            target = px * (1 + BUY_TARGET_PCT)
+            stop = px * (1 - BUY_STOP_PCT)
             entry_bar = i
         elif s == SELL:
             position = -1
             entry_price = px
-            target = px * (1 - TARGET_PCT)
-            stop = px * (1 + STOP_PCT)
+            target = px * (1 - SELL_TARGET_PCT)
+            stop = px * (1 + SELL_STOP_PCT)
             entry_bar = i
         if position != 0:
             open_trade = {"entry_i": i, "side": "LONG" if position == 1 else "SHORT",
@@ -289,23 +293,25 @@ def summarise(label, equity, trades, exit_reasons):
 
 
 def exit_sanity_check(close):
-    """Show how far price actually travels within MAX_HOLD_BARS, so TARGET_PCT /
-    STOP_PCT can be set to levels that can really be hit."""
+    """How often each side's own target/stop is reachable within MAX_HOLD_BARS."""
     s = pd.Series(close)
     H = MAX_HOLD_BARS
-    up = s[::-1].rolling(H).max()[::-1].shift(-1) / s - 1        # best case within next H bars
-    down = 1 - s[::-1].rolling(H).min()[::-1].shift(-1) / s      # worst case within next H bars
+    up = s[::-1].rolling(H).max()[::-1].shift(-1) / s - 1
+    down = 1 - s[::-1].rolling(H).min()[::-1].shift(-1) / s
     up, down = up.dropna(), down.dropna()
     q = [50, 90, 99]
     fmt = lambda a: " / ".join(f"{np.percentile(a, p):.2%}" for p in q)
     print(f"\n  Exit sanity check (any entry, {H}-bar hold):")
     print(f"    max up-move    p50/p90/p99 : {fmt(up)}")
     print(f"    max down-move  p50/p90/p99 : {fmt(down)}")
-    print(f"    target {TARGET_PCT:.2%} reachable on {(up >= TARGET_PCT).mean():.1%} of entries | "
-          f"stop {STOP_PCT:.2%} reachable on {(down >= STOP_PCT).mean():.1%}")
-    if (up >= TARGET_PCT).mean() < 0.02 or (down >= STOP_PCT).mean() < 0.02:
-        print("    ⚠  Target and/or stop are almost never reachable -> trades will just "
-              "time out. Lower TARGET_PCT / STOP_PCT or shorten MAX_HOLD_BARS.")
+    print(f"    BUY : target {BUY_TARGET_PCT:.2%} reachable {(up >= BUY_TARGET_PCT).mean():.1%} | "
+          f"stop {BUY_STOP_PCT:.2%} reachable {(down >= BUY_STOP_PCT).mean():.1%}")
+    print(f"    SELL: target {SELL_TARGET_PCT:.2%} reachable {(down >= SELL_TARGET_PCT).mean():.1%} | "
+          f"stop {SELL_STOP_PCT:.2%} reachable {(up >= SELL_STOP_PCT).mean():.1%}")
+    for name, a, b in (("BUY", up >= BUY_TARGET_PCT, down >= BUY_STOP_PCT),
+                       ("SELL", down >= SELL_TARGET_PCT, up >= SELL_STOP_PCT)):
+        if a.mean() < 0.02 or b.mean() < 0.02:
+            print(f"    ⚠  {name}: target and/or stop almost never reachable -> mostly timeouts.")
 
 
 def backtest():

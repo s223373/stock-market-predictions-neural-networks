@@ -19,8 +19,8 @@ from force_features import ForcedRootTree
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Data
-TICKER          = "SPY"
-PERIOD          = "60d"
+TICKER          = "BTC-USD"
+PERIOD          = "30d"
 INTERVAL        = "1m"
 
 # The three timeframes for building fully independent, per-timeframe
