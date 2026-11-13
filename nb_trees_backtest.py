@@ -59,12 +59,12 @@ EXIT_MODE = "fixed_pct"       # "fixed_pct" | "breaker"
 # Side-specific exits from signal_explorer (best TRAIN pair per side).
 # NOTE: tuned on 1m bars - re-run signal_explorer on PRIMARY_TF if it isn't 1m.
 BUY_TARGET_PCT = 0.0040       # +0.40%
-BUY_STOP_PCT = 0.0015         # -0.15%
+BUY_STOP_PCT = 0.0040        # -0.15%
 SELL_TARGET_PCT = 0.0055      # -0.55%
-SELL_STOP_PCT = 0.0035        # +0.35%
+SELL_STOP_PCT = 0.0055        # +0.35%
 MAX_HOLD_BARS = 50            # in PRIMARY_TF candles
 FEE_BPS = 1.0                 # per side
-LOSS_COOLDOWN_BARS = 50       # after a losing trade, skip signals for this many candles (0 = off)
+LOSS_COOLDOWN_BARS = 100       # after a losing trade, skip signals for this many candles (0 = off)
 COOLDOWN_PER_SIDE = True      # True = pause only the side that lost | False = pause both sides
 
 # ── Bar tuning (lookback / hold / cooldown) ──────────────────────────────────

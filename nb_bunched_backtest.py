@@ -12,10 +12,10 @@ FEE_BPS = 1.0
 
 # Side-specific exits, optimized in signal_explorer (best TRAIN pair per side)
 BUY_TARGET_PCT  = 0.0040    # +0.40%
-BUY_STOP_PCT    = 0.0015    # -0.15%
-SELL_TARGET_PCT = 0.0055    # -0.55%
-SELL_STOP_PCT   = 0.0035 
-TRAIN_FRAC = 0.8             # last (1 - TRAIN_FRAC) of the timeline = walk-forward test region
+BUY_STOP_PCT    = 0.0040    # -0.15%
+SELL_TARGET_PCT = 0.0040    # -0.55%
+SELL_STOP_PCT   = 0.0040 
+TRAIN_FRAC = 0.95             # last (1 - TRAIN_FRAC) of the timeline = walk-forward test region
 
 # "start" -> enter at the FIRST 1m bar of the 5-bar sample (lookahead, optimistic)
 # "end"   -> enter at the LAST 1m bar, i.e. when the sample is actually complete

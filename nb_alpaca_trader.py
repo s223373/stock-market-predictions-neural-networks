@@ -59,7 +59,7 @@ API_KEY    = os.environ["ALPACA_API_KEY"]
 SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
 PAPER      = True            # True = paper trading; False = live money
 
-SYMBOL      = "SPY"          # match the ticker the models were trained on
+SYMBOL      = "BTC"          # match the ticker the models were trained on
 DATA_FEED   = "iex"          # "iex" (free plan) or "sip" (paid plan)
 FETCH_BARS  = 600            # 1m bars fetched each cycle so indicators can warm up
 ORDER_QTY   = 1              # whole shares (bracket orders need whole shares)
