@@ -3,8 +3,14 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.naive_bayes import BernoulliNB
 
-from dataset_builder import BUY, HOLD, SELL, FORWARD_BARS
-from bunched_datasets import build_bunched_datasets
+
+import joblib
+from datetime import datetime
+from dataset_builder import TICKER, INTERVAL, BUY, HOLD, SELL, FORWARD_BARS   # extend your existing import
+from bunched_datasets import build_bunched_datasets, WINDOW                   # extend your existing import
+
+
+
 
 # ── Trade settings ───────────────────────────────────────────────────────────
 MAX_HOLD_BARS = 60          # matches the explorer's horizon the pairs were optimized on
@@ -15,7 +21,7 @@ BUY_TARGET_PCT  = 0.0040    # +0.40%
 BUY_STOP_PCT    = 0.0040    # -0.15%
 SELL_TARGET_PCT = 0.0040    # -0.55%
 SELL_STOP_PCT   = 0.0040 
-TRAIN_FRAC = 0.95             # last (1 - TRAIN_FRAC) of the timeline = walk-forward test region
+TRAIN_FRAC = 0.98             # last (1 - TRAIN_FRAC) of the timeline = walk-forward test region
 
 # "start" -> enter at the FIRST 1m bar of the 5-bar sample (lookahead, optimistic)
 # "end"   -> enter at the LAST 1m bar, i.e. when the sample is actually complete
@@ -292,6 +298,43 @@ def summarise(label, equity, trades, exit_reasons):
         print(f"Avg trade       : {t.mean():.4%}")
 
 
+def maybe_save_model(datasets, base, bool_cols, rows):
+    """Ask the user, then refit on ALL data using the last fold's tuned alpha and save a checkpoint."""
+    if not rows:
+        return
+    ans = input("\nSave model for live trading? [y/N]: ").strip().lower()
+    if ans not in ("y", "yes"):
+        print("Model not saved.")
+        return
+
+    last = rows[-1]
+    alpha, thr = last["alpha"], last["threshold"]
+    models = fit_models(datasets, bool_cols, alpha,
+                        base.index[0], base.index[-1] + pd.Timedelta(minutes=1))
+    if models is None:
+        print("Not enough data to fit the final models - nothing saved.")
+        return
+
+    checkpoint = {
+        "models": models,                  # {offset: BernoulliNB}
+        "bool_cols": bool_cols,
+        "window": WINDOW,
+        "ticker": TICKER,
+        "interval": INTERVAL,
+        "target_pct": BUY_TARGET_PCT,      # trader reads one pair (long-only for now)
+        "stop_pct": BUY_STOP_PCT,
+        "sell_target_pct": SELL_TARGET_PCT,
+        "sell_stop_pct": SELL_STOP_PCT,
+        "max_hold_bars": MAX_HOLD_BARS,
+        "alpha": alpha,
+        "threshold": thr,                  # None = argmax
+        "entry_mode": ENTRY_MODE,
+    }
+    path = f"NBBunched_{datetime.now():%Y-%m-%d_%H-%M-%S}.joblib"
+    joblib.dump(checkpoint, path)
+    print(f"✓ Saved → {path}  (alpha={alpha}, threshold={thr})")
+
+
 def exit_sanity_check(close):
     """How often each side's own target/stop is reachable within MAX_HOLD_BARS."""
     s = pd.Series(close)
@@ -355,7 +398,9 @@ def backtest():
     skipped = ev_i[~ev_i["i"].isin(taken)] if len(ev_i) else ev_i
 
     plot_trades(px_test, equity, tl, skipped, eq_baseline=eq_base)
+    maybe_save_model(datasets, base, bool_cols, rows)      # ← new
     return equity, np.array(trades), tl
+
 
 
 EXIT_STYLE = {"target": ("o", "green"), "stop": ("X", "red"), "timeout": ("s", "gray")}

@@ -1565,13 +1565,13 @@ FEATURES = [
     # ── liquidity sweeps  (_add_liquidity_sweeps) ──────────────────────────
     # "prev_day_high",       # CONTINUOUS price level — stays commented, see note below
     # "prev_day_low",        # CONTINUOUS price level — stays commented
-    "high_wick_sweep",     # wick pierced prev high but closed below it
-    "low_wick_sweep",      # wick pierced prev low  but closed above it
+    # "high_wick_sweep",     # wick pierced prev high but closed below it
+    # "low_wick_sweep",      # wick pierced prev low  but closed above it
 
-    # ── candle direction  (_add_candle_features) ───────────────────────────
-    "isGreen",             # close > open
-    "isHigh",              # green candle AND higher close than prior bar
-    "isLow",               # red candle AND lower close than prior bar
+    # # ── candle direction  (_add_candle_features) ───────────────────────────
+    # "isGreen",             # close > open
+    # "isHigh",              # green candle AND higher close than prior bar
+    # "isLow",               # red candle AND lower close than prior bar
 
     # ── structural trend  (_add_structural_trend) ──────────────────────────
     # drop_first=True drops "trend_downtrend" (alphabetically first).

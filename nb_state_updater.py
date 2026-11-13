@@ -44,7 +44,9 @@ def update_models(datasets, bool_cols, state, base_index, alpha=None):
 
 if __name__ == "__main__":
     # build bunched datasets, update models, save state
-    from bunched_datasets import build_bunched_datasets, META_COLS
+    from bunched_datasets import build_bunched_datasets
+
+    META_COLS = ["Close", "target", "start_ts"]
 
     datasets, base = build_bunched_datasets(return_base=True)
     bool_cols = [c for c in datasets[0].columns if c not in META_COLS]
